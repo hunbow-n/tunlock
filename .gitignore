@@ -1,4 +1,5 @@
 *.conf
 !tests/fixtures/*.conf
 .DS_Store
+/.idea/
 build/
