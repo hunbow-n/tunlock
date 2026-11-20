@@ -1,0 +1,1183 @@
+#!/bin/bash
+# tunlock: keep an SSH tunnel to your own server up and let traffic leave
+# a Mac only through a verified tunnel. Fails closed: when the tunnel, the
+# TUN client or the egress check fails, the internet stays blocked until
+# the path is verified again or you choose direct mode yourself.
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# Tests swap system tools for stubs. Root never sees this: sudo and launchd
+# start with a clean environment.
+if [[ -n ${TUNLOCK_TEST_PATH:-} && $EUID != 0 ]]; then PATH=$TUNLOCK_TEST_PATH:$PATH; fi
+
+VERSION=0.1.0
+PREFIX=${TUNLOCK_PREFIX:-/usr/local}
+CONF=${TUNLOCK_CONF:-$PREFIX/etc/tunlock.conf}
+STATE_DIR=${TUNLOCK_STATE_DIR:-/var/db/tunlock}  # persistent: chosen mode
+RUN_DIR=${TUNLOCK_RUN_DIR:-/var/run/tunlock}     # cleared at boot: live state
+RESOLVER_DIR=${TUNLOCK_RESOLVER_DIR:-/etc/resolver}
+RESOLVER_MARK='# managed by tunlock'
+GUARD_LABEL=tunlock.guard
+SSH_LABEL=tunlock.ssh
+TICK=2
+
+die() { echo "tunlock: $*" >&2; exit 1; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+is_ipv4() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local i
+  for i in 1 2 3 4; do (( BASH_REMATCH[i] <= 255 )) || return 1; done
+}
+is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# ---------------------------------------------------------------- config
+
+CONFIG_KEYS='VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS PROBE_URL PROBE_INTERVAL PF_ANCHOR'
+
+# Parse KEY=value lines without sourcing: the guard runs as root.
+load_config() {
+  [[ -r $CONF ]] || die "config not found: $CONF (copy tunlock.conf.example there)"
+  local key line n=0 val
+  for key in $CONFIG_KEYS; do printf -v "$key" '%s' ''; done
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]] || die "$CONF:$n: expected KEY=value"
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]}
+    val=${val%%[[:space:]]#*}
+    val=${val%"${val##*[![:space:]]}"}
+    if [[ $val =~ ^\"(.*)\"$ || $val =~ ^\'(.*)\'$ ]]; then val=${BASH_REMATCH[1]}; fi
+    [[ " $CONFIG_KEYS " == *" $key "* ]] || die "$CONF:$n: unknown key $key"
+    printf -v "$key" '%s' "$val"
+  done < "$CONF"
+
+  : "${SSH_HOST:=$VPS_IP}" "${EXPECTED_EGRESS:=$VPS_IP}" "${SSH_PORT:=22}"
+  : "${PROBE_URL:=https://1.1.1.1/cdn-cgi/trace}" "${PROBE_INTERVAL:=30}"
+  : "${PF_ANCHOR:=com.apple/000.tunlock}" "${JUMP_USER:=$SSH_USER}" "${JUMP_PORT:=22}"
+
+  is_ipv4 "$VPS_IP" || die "VPS_IP must be an IPv4 address"
+  is_ipv4 "$SSH_HOST" || die "SSH_HOST must be an IPv4 address: DNS is blocked while protected"
+  is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address"
+  is_ipv4 "$TUN_ADDR" || die "TUN_ADDR must be the IPv4 address of your TUN interface"
+  is_port "$SSH_PORT" || die "SSH_PORT is not a port"
+  # Cascade: SSH enters through JUMP_HOST and reaches SSH_HOST from there.
+  # Only the entry is reachable outside the tunnel; egress stays EXPECTED_EGRESS.
+  if [[ -n $JUMP_HOST ]]; then
+    is_ipv4 "$JUMP_HOST" || die "JUMP_HOST must be an IPv4 address: DNS is blocked while protected"
+    is_port "$JUMP_PORT" || die "JUMP_PORT is not a port"
+    [[ $JUMP_USER =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "JUMP_USER is invalid"
+    ENTRY_HOST=$JUMP_HOST ENTRY_PORT=$JUMP_PORT
+  else
+    ENTRY_HOST=$SSH_HOST ENTRY_PORT=$SSH_PORT
+  fi
+  parse_bypass
+  # Name of the TUN client's VPN service in "scutil --nc list" (e.g. Karing):
+  # optional; when set, on/off also start and stop it.
+  [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
+  TUN_NET=$(tun_net "$TUN_MASK")
+  # Goes into a ProxyCommand line, so keep it to plain path characters.
+  [[ -z $SSH_IDENTITY || $SSH_IDENTITY =~ ^[~A-Za-z0-9._/-]+$ ]] || die "SSH_IDENTITY: use a path without spaces"
+  [[ -z $TUN_MASK || $TUN_MASK =~ ^0x[0-9a-f]{8}$ ]] || die "TUN_MASK must look like 0xfffffffc"
+  [[ $SSH_USER =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "SSH_USER is missing or invalid"
+  [[ $PROBE_INTERVAL =~ ^[0-9]+$ ]] && (( PROBE_INTERVAL >= 5 )) || die "PROBE_INTERVAL must be >= 5"
+  [[ $PF_ANCHOR =~ ^[A-Za-z0-9._/-]+$ ]] || die "PF_ANCHOR is invalid"
+  PROBE_IP=''
+  [[ $PROBE_URL =~ ^https://([0-9.]+)(/[A-Za-z0-9._/~-]*)?$ ]] && PROBE_IP=${BASH_REMATCH[1]}
+  is_ipv4 "$PROBE_IP" || die "PROBE_URL must be https:// with an IPv4 literal host"
+  parse_forward
+}
+
+is_cidr() {
+  [[ $1 =~ ^([0-9.]+)/([0-9]{1,2})$ ]] || return 1
+  local bits=${BASH_REMATCH[2]}
+  is_ipv4 "${1%/*}" && (( bits >= 8 && bits <= 32 ))
+}
+
+# Exceptions: networks reached directly, around the tunnel, on any port, in
+# every phase; and DNS servers for chosen domains (/etc/resolver).
+#   BYPASS_NETS="192.168.0.0/24 10.10.0.0/16"
+#   BYPASS_DNS="corp.example=192.168.0.1 lab.example=10.10.0.2"
+parse_bypass() {
+  local item dom ip
+  BYPASS_LIST=()
+  DNS_DOMAINS=()
+  DNS_SERVERS=()
+  for item in $BYPASS_NETS; do
+    is_cidr "$item" || die "BYPASS_NETS: $item is not an IPv4 network like 192.168.0.0/24"
+    BYPASS_LIST+=("$item")
+  done
+  for item in $BYPASS_DNS; do
+    dom=${item%%=*}
+    ip=${item#*=}
+    [[ $item == *=* && $dom =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]] \
+      || die "BYPASS_DNS: $item must look like corp.example=192.168.0.1"
+    is_ipv4 "$ip" || die "BYPASS_DNS: $ip is not an IPv4 address"
+    DNS_DOMAINS+=("$dom")
+    DNS_SERVERS+=("$ip")
+  done
+}
+
+# SSH_FORWARD holds -L/-D options, e.g. "-L 127.0.0.1:1080:127.0.0.1:8388".
+# The first one gives the local port that health checks look at.
+parse_forward() {
+  local words opt spec i
+  read -r -a words <<< "$SSH_FORWARD"
+  (( ${#words[@]} >= 2 && ${#words[@]} % 2 == 0 )) || die "SSH_FORWARD needs -L or -D options"
+  FORWARD_ARGS=()
+  HEALTH_HOST=''
+  HEALTH_PORT=''
+  for (( i = 0; i < ${#words[@]}; i += 2 )); do
+    opt=${words[i]}
+    spec=${words[i + 1]}
+    [[ $opt == -L || $opt == -D ]] || die "SSH_FORWARD: unsupported option $opt"
+    [[ $spec =~ ^[A-Za-z0-9._:-]+$ ]] || die "SSH_FORWARD: invalid spec $spec"
+    FORWARD_ARGS+=("$opt" "$spec")
+    [[ -z $HEALTH_PORT ]] || continue
+    local f
+    IFS=: read -r -a f <<< "$spec"
+    case "$opt:${#f[@]}" in
+      -L:3 | -D:1) HEALTH_HOST=127.0.0.1; HEALTH_PORT=${f[0]} ;;
+      -L:4 | -D:2) HEALTH_HOST=${f[0]}; HEALTH_PORT=${f[1]} ;;
+      *) die "SSH_FORWARD: cannot read the local port of $spec" ;;
+    esac
+    case $HEALTH_HOST in '' | '*' | localhost | 0.0.0.0) HEALTH_HOST=127.0.0.1 ;; esac
+    is_port "$HEALTH_PORT" || die "SSH_FORWARD: bad local port in $spec"
+  done
+}
+
+# ---------------------------------------------------------------- network
+
+physical_iface() {
+  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ { print $4; exit }'
+}
+
+# Tests feed a recorded ifconfig output through TUNLOCK_TEST_IFCONFIG.
+ifconfig_dump() {
+  if [[ -n ${TUNLOCK_TEST_IFCONFIG:-} ]]; then cat "$TUNLOCK_TEST_IFCONFIG"; else ifconfig -a; fi
+}
+
+physical_gateway() {
+  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ { print $2; exit }'
+}
+
+# The utun number changes between connects, so find it by its address.
+find_tun() { find_tun_mask | awk '{ print $1 }'; }
+
+# "utunN 0xffffff.." for the utun carrying TUN_ADDR.
+find_tun_mask() {
+  ifconfig_dump | awk -v ip="$TUN_ADDR" -v mask="$TUN_MASK" '
+    /^[a-z]/ { sub(/:.*/, "", $1); ifc = $1; next }
+    ifc ~ /^utun[0-9]+$/ && $1 == "inet" && $2 == ip && (mask == "" || $NF == mask) {
+      print ifc, $NF; exit
+    }'
+}
+
+# The TUN client's own subnet (TUN_ADDR with a hex mask), e.g. 10.20.0.0/30.
+# System-stack TUN clients (sing-box, Karing) rewrite each connection to a
+# peer address inside it, so even the probe's packets travel within it.
+tun_net() {
+  local mask=$1 m a b c d bits
+  [[ $mask =~ ^0x[0-9a-f]{8}$ ]] || { echo "$TUN_ADDR/32"; return; }
+  m=$(( 16#${mask#0x} ))
+  IFS=. read -r a b c d <<< "$TUN_ADDR"
+  bits=0
+  local x=$m
+  while (( x & 0x80000000 )); do bits=$((bits + 1)); x=$(( (x << 1) & 0xffffffff )); done
+  echo "$(( a & (m >> 24 & 255) )).$(( b & (m >> 16 & 255) )).$(( c & (m >> 8 & 255) )).$(( d & (m & 255) ))/$bits"
+}
+
+# Ask a fixed IP (no DNS) which address we come from, through the tunnel.
+probe_egress() {
+  curl -4fsS --noproxy '*' --interface "$TUN_ADDR" --connect-timeout 4 --max-time 6 \
+    "$PROBE_URL" 2>/dev/null | awk -F= '$1 == "ip" { ip = $2 } $1 == "loc" { loc = $2 } END { if (ip != "") print ip, loc }'
+}
+
+ssh_up() { nc -z -G 1 "$HEALTH_HOST" "$HEALTH_PORT" >/dev/null 2>&1; }
+
+# Is the SSH entry reachable outside the tunnel? Bound to the physical
+# interface, or the check would travel through the tunnel itself.
+entry_up() {
+  local phys
+  phys=$(physical_iface)
+  [[ -n $phys ]] && nc -z -G 2 -b "$phys" "$ENTRY_HOST" "$ENTRY_PORT" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- pf rules
+
+# Phases while protected:
+#   block  no TUN interface found: only SSH entry, DHCP, loopback, exceptions
+#   probe  TUN found, egress not verified: only the HTTPS probe may use it
+#   open   egress verified: everything from the TUN address may leave
+# Every phase ends in "block drop quick all", IPv6 included. That rule carries
+# a label with a hash of the set, so the guard can confirm pf holds exactly it.
+render_rules() {
+  local phase=$1 ifc=${2:-} phys=${3:-} body
+  [[ -z $phys || $phys =~ ^en[0-9]+$ ]] || die "render_rules: bad physical interface $phys"
+  case $phase in
+    block) ;;
+    probe | open) [[ $ifc =~ ^utun[0-9]+$ ]] || die "render_rules: bad interface $ifc" ;;
+    *) die "render_rules: unknown phase $phase" ;;
+  esac
+  body=$(render_body "$phase" "$ifc" "$phys")
+  echo "# tunlock $VERSION phase=$phase"
+  echo "$body"
+  echo "block drop quick all label \"tunlock-$(md5 -q -s "$body" | cut -c1-12)\""
+}
+
+render_body() {
+  local phase=$1 ifc=$2 phys=$3 item
+  echo "pass quick on lo0 all no state"
+  echo "pass out quick inet proto tcp to $ENTRY_HOST port $ENTRY_PORT flags any keep state (if-bound)"
+  echo "pass out quick inet proto udp from any port 68 to any port 67 no state"
+  echo "pass in quick inet proto udp from any port 67 to any port 68 no state"
+  # Exceptions leave only through the physical interface, never another tunnel.
+  if [[ -n $phys ]]; then
+    for item in ${BYPASS_LIST[@]+"${BYPASS_LIST[@]}"}; do
+      echo "pass out quick on $phys inet from any to $item keep state (if-bound)"
+    done
+    for item in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do
+      echo "pass out quick on $phys inet proto { tcp udp } from any to $item port 53 keep state (if-bound)"
+    done
+  fi
+  case $phase in
+    probe)
+      echo "pass out quick on $ifc inet proto tcp from $TUN_ADDR to $PROBE_IP port 443 no state"
+      echo "pass in quick on $ifc inet proto tcp from $PROBE_IP port 443 to $TUN_ADDR no state"
+      # The TUN stack's internal leg (e.g. 10.20.0.1 <-> 10.20.0.2). Nothing
+      # leaves the Mac this way: apps' own packets still need the rule above.
+      if [[ $TUN_NET != "$TUN_ADDR/32" ]]; then
+        echo "pass out quick on $ifc inet from $TUN_NET to $TUN_NET no state"
+        echo "pass in quick on $ifc inet from $TUN_NET to $TUN_NET no state"
+      fi
+      ;;
+    open)
+      echo "pass out quick on $ifc inet from $TUN_ADDR to any no state"
+      echo "pass in quick on $ifc inet from any to $TUN_ADDR no state"
+      ;;
+  esac
+}
+
+rules_label() { awk -F'"' '/^block drop quick all label/ { print $2 }' <<< "$1"; }
+
+pf_enabled() { pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; }
+pf_has_label() { [[ -n $1 ]] && pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -qF "label \"$1\""; }
+pf_rules_live() { pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'label "tunlock-'; }
+pf_rule_count() { pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -c . || true; }
+
+# Our anchor only runs if the root ruleset reaches it.
+pf_anchor_reachable() {
+  local parent=${PF_ANCHOR%/*} root
+  root=$(pfctl -sr 2>/dev/null)
+  if [[ $PF_ANCHOR == */* ]]; then
+    grep -qF "anchor \"$parent/*\"" <<< "$root"
+  else
+    grep -qF "anchor \"$PF_ANCHOR\"" <<< "$root"
+  fi
+}
+
+# Being reachable is not enough: rules evaluated before our anchor may decide
+# first, and then the status would describe rules pf never uses. pf semantics:
+#   - a rule marked quick ends evaluation when it matches;
+#   - an anchor call marked quick ends evaluation when ANY rule inside it
+#     matches, quick or not, nested anchors included.
+# Prints one line per conflict found in the root ruleset before the call that
+# reaches our anchor, and in sibling anchors that sort before ours.
+pf_conflicts() {
+  local root line parent=${PF_ANCHOR%/*} mine=${PF_ANCHOR##*/} child reach reach_quick=0
+  if [[ $PF_ANCHOR == */* ]]; then reach="anchor \"$parent/*\""; else reach="anchor \"$PF_ANCHOR\""; fi
+  root=$(pfctl -sr 2>/dev/null) || { echo "pf did not answer"; return; }
+  while IFS= read -r line; do
+    if [[ $line == "$reach"* ]]; then
+      [[ $line == *" quick"* ]] && reach_quick=1
+      break
+    fi
+    rule_decides_first "$line" 0 0
+  done <<< "$root"
+  [[ $PF_ANCHOR == */* ]] || return 0
+  local siblings
+  if ! siblings=$(anchor_children "$parent"); then
+    echo "cannot list the anchors under \"$parent\""
+    return 0
+  fi
+  for child in $siblings; do
+    [[ ${child##*/} < $mine ]] || continue
+    anchor_decides_first "$child" "$reach_quick" 1 && echo "anchor $child sorts before ours"
+  done
+  return 0
+}
+
+# rule_decides_first line inherited_quick depth: prints a conflict if this rule,
+# or an anchor it calls, can end evaluation before our anchor.
+rule_decides_first() {
+  local line=$1 inherited=$2 depth=$3 name q=0 child
+  [[ -z $line || $line == scrub* ]] && return 0
+  [[ $line == *" quick"* || $inherited == 1 ]] && q=1
+  if [[ $line =~ ^anchor\ \"([^\"]+)\" ]]; then
+    name=${BASH_REMATCH[1]}
+    if [[ $name == */\* ]]; then
+      local children
+      if ! children=$(anchor_children "${name%/\*}"); then
+        echo "cannot list the anchors under \"$name\""
+        return 0
+      fi
+      for child in $children; do
+        anchor_decides_first "$child" "$q" "$((depth + 1))" && echo "anchor $child (via \"$name\") is evaluated first"
+      done
+    elif anchor_decides_first "$name" "$q" "$((depth + 1))"; then
+      echo "anchor \"$name\" is evaluated first"
+    fi
+  elif (( q )); then
+    echo "rule evaluated first: $line"
+  fi
+  return 0
+}
+
+# anchor_decides_first name quick_call depth: true if a match inside can end
+# evaluation. Deeper than 4 levels counts as a conflict: unknown is not safe.
+anchor_decides_first() {
+  local name=$1 qcall=$2 depth=$3 rules line
+  (( depth <= 4 )) || return 0
+  rules=$(pfctl -a "$name" -sr 2>/dev/null) || return 0
+  [[ -n $rules ]] || return 1
+  (( qcall )) && return 0
+  while IFS= read -r line; do
+    [[ -n $(rule_decides_first "$line" 0 "$depth") ]] && return 0
+  done <<< "$rules"
+  return 1
+}
+
+# Child anchors of $1. Fails when pf does not answer: an unreadable list is
+# not an empty one, so callers report it as a conflict.
+anchor_children() {
+  local out
+  out=$(pfctl -a "$1" -s Anchors 2>/dev/null) || return 1
+  awk '{ print $1 }' <<< "$out"
+}
+
+ensure_root_ruleset() {
+  pf_anchor_reachable && return 0
+  if [[ -z $(pfctl -sr 2>/dev/null) ]]; then
+    log "root ruleset empty, loading /etc/pf.conf"
+    pfctl -f /etc/pf.conf 2>/dev/null || true
+  fi
+  pf_anchor_reachable
+}
+
+# Replacing an anchor's rules is a single transaction: there is no moment
+# with an empty anchor, so rebinding to a new utun opens no direct path.
+# Succeeds only when pf accepted the set and now reports its label.
+pf_apply() {
+  local out
+  if ! out=$(printf '%s\n' "$1" | pfctl -a "$PF_ANCHOR" -f - 2>&1); then
+    G_ERROR="pf rejected the rules: $(grep -v '^No ALTQ' <<< "$out" | head -1)"
+    return 1
+  fi
+  pf_has_label "$(rules_label "$1")" || { G_ERROR="pf did not confirm the new rules"; return 1; }
+}
+
+pf_enable_ref() {
+  local out token
+  out=$(pfctl -E 2>&1) || true
+  token=$(awk '/Token/ { print $NF }' <<< "$out")
+  [[ -n $token ]] && echo "$token" > "$RUN_DIR/token"
+  pf_enabled
+}
+
+# Succeeds only when the anchor is confirmed empty. Only then is our pf
+# reference released; otherwise the token is kept for the next attempt.
+pf_release() {
+  local live
+  pfctl -a "$PF_ANCHOR" -F rules >/dev/null 2>&1 || true
+  # Silence is not proof: pf must answer the read, and without our rules.
+  if ! live=$(pfctl -a "$PF_ANCHOR" -sr 2>/dev/null); then
+    G_ERROR="pf did not answer; tunlock rules may still be loaded"
+    return 1
+  fi
+  if grep -q 'label "tunlock-' <<< "$live"; then
+    G_ERROR="pf did not remove the tunlock rules"
+    return 1
+  fi
+  if [[ -s $RUN_DIR/token ]]; then
+    if ! pfctl -X "$(cat "$RUN_DIR/token")" >/dev/null 2>&1; then
+      G_ERROR="pf did not release the tunlock reference (token kept)"
+      return 1
+    fi
+  fi
+  rm -f "$RUN_DIR/token"
+}
+
+# ---------------------------------------------------------------- exceptions
+
+net_probe_ip() {
+  local base=${1%/*}
+  [[ $1 == */32 ]] && { echo "$base"; return; }
+  echo "${base%.*}.$(( ${base##*.} + 1 ))"
+}
+
+route_op() { # add|delete net gateway; a /32 is a host route
+  if [[ $2 == */32 ]]; then route -n "$1" -host "${2%/32}" "$3"; else route -n "$1" -net "$2" "$3"; fi
+}
+
+# Exception networks plus every exception DNS server as a /32: a DNS server
+# outside BYPASS_NETS also needs its route around the tunnel.
+bypass_targets() {
+  local item
+  for item in ${BYPASS_LIST[@]+"${BYPASS_LIST[@]}"}; do echo "$item"; done
+  for item in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do echo "$item/32"; done
+}
+
+# "interface gateway" of the route the kernel uses right now (gateway is
+# empty for a directly connected network).
+route_info() {
+  route -n get "$1" 2>/dev/null | awk '/interface:/ { i = $2 } /gateway:/ { g = $2 } END { print i, g }'
+}
+
+# A TUN client in global mode owns the default route. Exception networks need
+# a route to the physical gateway. The live kernel route is checked on every
+# tick: after sleep or a network change it may have moved to the tunnel even
+# when the gateway address stayed the same. Routes added here are recorded in
+# $RUN_DIR/routes and are the only ones ever removed.
+sync_bypass_routes() {
+  local phys gw net rec keep='' cur_if cur_gw
+  phys=$(physical_iface)
+  gw=$(physical_gateway)
+  touch "$RUN_DIR/routes"
+  for net in $(bypass_targets); do
+    [[ $keep != *" $net "* ]] || continue
+    keep="$keep $net "
+    [[ -n $phys && $gw =~ ^[0-9.]+$ ]] || continue
+    read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
+    if [[ $cur_if == "$phys" && ( -z $cur_gw || $cur_gw == "$gw" || $cur_gw == link#* ) ]]; then
+      continue  # directly connected, or already via today's gateway
+    fi
+    rec=$(awk -v n="$net" '$1 == n { print $2 }' "$RUN_DIR/routes")
+    if [[ -n $rec ]]; then
+      route_op delete "$net" "$rec" >/dev/null 2>&1 || true
+      route_forget "$net"
+    fi
+    if route_op add "$net" "$gw" >/dev/null 2>&1; then
+      echo "$net $gw" >> "$RUN_DIR/routes"
+      log "exception: $net via $gw ($phys)"
+    fi
+    read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
+    [[ $cur_if == "$phys" ]] || G_WARNING="$net routes via ${cur_if:-nothing}, not $phys (a route tunlock did not create may be in the way)"
+  done
+  while read -r net rec; do
+    [[ -n $net && $keep != *" $net "* ]] || continue
+    route_op delete "$net" "$rec" >/dev/null 2>&1 || true
+    route_forget "$net"
+    log "exception removed: $net"
+  done < "$RUN_DIR/routes"
+}
+
+route_forget() {
+  awk -v n="$1" '$1 != n' "$RUN_DIR/routes" > "$RUN_DIR/routes.tmp"
+  mv -f "$RUN_DIR/routes.tmp" "$RUN_DIR/routes"
+}
+
+# Per-domain DNS via /etc/resolver. Files without our marker are not touched.
+sync_resolvers() {
+  local i dom f want
+  mkdir -p "$RESOLVER_DIR"
+  for (( i = 0; i < ${#DNS_DOMAINS[@]}; i++ )); do
+    dom=${DNS_DOMAINS[i]}
+    f=$RESOLVER_DIR/$dom
+    want=$(printf '%s\nnameserver %s' "$RESOLVER_MARK" "${DNS_SERVERS[i]}")
+    if [[ -e $f ]] && ! grep -qxF "$RESOLVER_MARK" "$f"; then
+      G_WARNING="$f exists and is not managed by tunlock"
+      continue
+    fi
+    if [[ $(cat "$f" 2>/dev/null) != "$want" ]]; then
+      printf '%s\n' "$want" > "$f"
+      chmod 644 "$f"
+      log "dns: $dom -> ${DNS_SERVERS[i]}"
+    fi
+  done
+  for f in "$RESOLVER_DIR"/*; do
+    [[ -f $f ]] && grep -qxF "$RESOLVER_MARK" "$f" || continue
+    dom=${f##*/}
+    [[ " ${DNS_DOMAINS[*]-} " == *" $dom "* ]] && continue
+    rm -f "$f"
+    log "dns: $dom removed"
+  done
+}
+
+cmd_cleanup() {
+  require_root
+  load_config
+  BYPASS_LIST=() DNS_DOMAINS=() DNS_SERVERS=()
+  mkdir -p "$RUN_DIR"
+  sync_bypass_routes
+  sync_resolvers
+}
+
+# ---------------------------------------------------------------- guard
+
+read_mode() {
+  local m
+  m=$(cat "$STATE_DIR/mode" 2>/dev/null || true)
+  [[ $m == protected ]] && echo protected || echo direct
+}
+
+write_state() {
+  local tmp=$RUN_DIR/state.$$
+  {
+    echo "updated=$(date +%s)"
+    echo "ack=$G_ACK_NEXT"
+    echo "mode=$G_MODE"
+    echo "phase=$G_PHASE"
+    echo "tun=$G_TUN"
+    echo "ssh=$G_SSH"
+    echo "ssh_endpoint=$HEALTH_HOST:$HEALTH_PORT"
+    echo "entry=$ENTRY_HOST:$ENTRY_PORT"
+    echo "entry_up=$G_ENTRY"
+    echo "cascade=$([[ -n $JUMP_HOST ]] && echo 1 || echo 0)"
+    echo "egress_ip=$G_EGRESS_IP"
+    echo "egress_ok=$G_EGRESS_OK"
+    echo "egress_at=$G_EGRESS_AT"
+    echo "egress_country=$G_EGRESS_COUNTRY"
+    echo "phys=$G_PHYS"
+    echo "expected=$EXPECTED_EGRESS"
+    echo "pf_enabled=$G_PF_ENABLED"
+    echo "pf_rules=$G_PF_RULES"
+    echo "pf_anchor=$PF_ANCHOR"
+    echo "pf_reachable=$G_PF_REACHABLE"
+    echo "error=$G_ERROR"
+    echo "pf_conflict=$G_CONFLICT"
+    echo "warning=$G_WARNING"
+    echo "bypass=${BYPASS_LIST[*]-}"
+  } > "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$RUN_DIR/state"
+}
+
+guard_sync_rules() {
+  local want rules
+  if [[ -z $G_TUN ]]; then want=block
+  elif [[ $G_EGRESS_OK == 1 ]]; then want=open
+  else want=probe
+  fi
+  rules=$(render_rules "$want" "$G_TUN" "$G_PHYS")
+  if [[ $rules == "$G_APPLIED" ]] && pf_has_label "$(rules_label "$rules")"; then
+    G_PHASE=$want
+    return 0
+  fi
+  if pf_apply "$rules"; then
+    G_APPLIED=$rules
+    G_PHASE=$want
+    log "pf: phase $want${G_TUN:+ on $G_TUN}"
+    return 0
+  fi
+  G_APPLIED=''
+  log "pf: FAILED to apply phase $want: $G_ERROR"
+  fail_closed
+  return 1
+}
+
+# The wanted set was rejected, and the anchor may still hold an older, more
+# permissive one. Fall back step by step; the next tick retries the wanted set.
+fail_closed() {
+  local err=$G_ERROR
+  if pf_apply "$(render_emergency)"; then
+    G_PHASE=emergency
+    G_ERROR="$err; emergency block loaded"
+    log "pf: emergency block loaded"
+    return 0
+  fi
+  # pf refuses every load. Any utun the loaded rules still let traffic into is
+  # no longer trusted: take each one down and confirm it. The old set's final
+  # block still stops direct traffic. The interfaces come from the live rules,
+  # not from G_TUN, which may already point at a newer utun.
+  local ifc downed='' stuck=''
+  for ifc in $(pfctl -a "$PF_ANCHOR" -sr 2>/dev/null \
+      | grep -oE "on utun[0-9]+ inet( proto tcp)? from $TUN_ADDR to" | awk '{ print $2 }' | sort -u); do
+    ifconfig "$ifc" down >/dev/null 2>&1 || true
+    if [[ $(iface_state "$ifc") == down ]]; then downed="$downed $ifc"; else stuck="$stuck $ifc"; fi
+  done
+  G_ERROR="$err; pf refuses all loads"
+  [[ -z $downed ]] || { G_ERROR="$G_ERROR; taken down:$downed"; log "pf refuses all loads: taken down:$downed"; }
+  [[ -z $stuck ]] || { G_ERROR="$G_ERROR; could NOT confirm taken down:$stuck"; log "pf refuses all loads: could NOT confirm taken down:$stuck"; }
+  G_PHASE=failed  # nothing confirmed: never report a phase pf did not take
+}
+
+# up, down or unknown (when ifconfig cannot read the interface).
+iface_state() {
+  local first
+  first=$(ifconfig "$1" 2>/dev/null | head -1) || true
+  [[ $first == "$1:"*flags=* ]] || { echo unknown; return; }
+  if grep -q '<UP[,>]' <<< "$first"; then echo up; else echo down; fi
+}
+
+# Smallest set that still lets SSH reconnect and the Mac keep its address.
+render_emergency() {
+  local body
+  body=$(printf '%s\n' "pass quick on lo0 all no state" \
+    "pass out quick inet proto tcp to $ENTRY_HOST port $ENTRY_PORT flags any keep state (if-bound)" \
+    "pass out quick inet proto udp from any port 68 to any port 67 no state" \
+    "pass in quick inet proto udp from any port 67 to any port 68 no state")
+  echo "# tunlock $VERSION emergency"
+  echo "$body"
+  echo "block drop quick all label \"tunlock-emergency\""
+}
+
+# Is the verified egress still trustworthy? Anything that breaks the path
+# sends the tunnel back to probe until a fresh answer comes back.
+egress_still_valid() {
+  local now=$1
+  [[ $G_EGRESS_OK == 1 ]] || return 0
+  if [[ $G_SSH == down ]]; then
+    log "ssh forward down: egress unverified, tunnel closed until verified"
+  elif (( now - G_EGRESS_AT > PROBE_INTERVAL * 2 + 10 )); then
+    log "egress check expired: tunnel closed until verified"
+  else
+    return 0
+  fi
+  G_EGRESS_OK=0
+}
+
+guard_tick() {
+  local now ip tun req
+  now=$(date +%s)
+  # Read the CLI's request id before the mode: the CLI writes the mode first,
+  # so an id seen here always comes with its mode. Echoed as ack in the state.
+  req=$(cat "$STATE_DIR/request" 2>/dev/null || true)
+  # A long gap between ticks means the Mac slept. The TUN client may have
+  # reconnected elsewhere under the same utun, so verify egress again.
+  if (( G_LAST_TICK > 0 && now - G_LAST_TICK > 10 )) && [[ $G_EGRESS_OK == 1 ]]; then
+    log "woke after $((now - G_LAST_TICK))s: re-verifying egress"
+    G_EGRESS_OK=0
+  fi
+  G_LAST_TICK=$now
+  G_MODE=$(read_mode)
+  G_ACK_NEXT=$req
+  G_ERROR=''
+  G_WARNING=''
+  G_PHYS=$(physical_iface)
+  # Exceptions hold in both modes, so the LAN works the same either way.
+  sync_bypass_routes
+  sync_resolvers
+  if ssh_up; then G_SSH=up; else G_SSH=down; fi
+  if (( now - G_ENTRY_AT >= 15 )); then
+    G_ENTRY_AT=$now
+    if entry_up; then G_ENTRY=up; else G_ENTRY=down; fi
+  fi
+
+  if [[ $G_MODE == direct ]]; then
+    if [[ -n $G_APPLIED || -e $RUN_DIR/token ]] || pf_rules_live; then
+      if pf_release; then
+        log "direct mode: rules removed, pf reference released"
+      else
+        log "direct mode: FAILED to remove rules: $G_ERROR"
+      fi
+    fi
+    rm -f "$RUN_DIR/armed"
+    G_APPLIED='' G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_ARMED=0
+    G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT=''
+    if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
+    return
+  fi
+
+  if ! ensure_root_ruleset; then
+    G_ERROR="root pf ruleset does not reach anchor $PF_ANCHOR"
+  fi
+
+  local tm
+  tm=$(find_tun_mask || true)
+  tun=${tm%% *}
+  if [[ -n $tun && -z $TUN_MASK ]]; then TUN_NET=$(tun_net "${tm#* }"); fi
+  if [[ $tun != "$G_TUN" ]]; then
+    [[ -n $tun ]] && log "tun: ${G_TUN:-none} -> $tun" || log "tun: $G_TUN gone"
+    G_TUN=$tun
+    G_EGRESS_OK=0  # a new interface has to prove its egress again
+  fi
+  egress_still_valid "$now"
+  local rules_ok=1
+  guard_sync_rules || rules_ok=0
+
+  if ! pf_enabled || [[ ! -s $RUN_DIR/token ]]; then
+    if pf_enable_ref; then
+      log "pf enabled (token $(cat "$RUN_DIR/token" 2>/dev/null || echo none))"
+    else
+      G_ERROR=${G_ERROR:-"pf could not be enabled"}
+    fi
+  fi
+  # Connections opened before protection keep their pf state; drop them once,
+  # after our rules are confirmed in place.
+  if [[ $G_ARMED == 0 && $rules_ok == 1 ]]; then
+    if pfctl -F states >/dev/null 2>&1; then
+      touch "$RUN_DIR/armed"
+      G_ARMED=1
+      log "protected mode armed, existing connections reset"
+    else
+      G_ERROR=${G_ERROR:-"could not reset existing connections"}
+    fi
+  fi
+  [[ $G_ARMED == 1 ]] || G_ERROR=${G_ERROR:-"existing connections not reset yet"}
+
+  if [[ -n $G_TUN && $rules_ok == 1 ]]; then
+    local interval=$PROBE_INTERVAL
+    [[ $G_EGRESS_OK == 1 ]] || interval=3
+    if (( now - G_PROBE_AT >= interval )); then
+      G_PROBE_AT=$now
+      local loc=''
+      read -r ip loc <<< "$(probe_egress || true)"
+      [[ $loc =~ ^[A-Z]{2}$ ]] && G_EGRESS_COUNTRY=$loc
+      if [[ $ip == "$EXPECTED_EGRESS" ]]; then
+        [[ $G_EGRESS_OK == 1 ]] || log "egress verified: $ip via $G_TUN"
+        G_EGRESS_OK=1 G_EGRESS_IP=$ip G_EGRESS_AT=$now
+      elif [[ -n $ip ]]; then
+        log "egress MISMATCH: got $ip, expected $EXPECTED_EGRESS; tunnel closed"
+        G_EGRESS_OK=0 G_EGRESS_IP=$ip G_EGRESS_AT=$now
+      elif [[ $G_EGRESS_OK == 1 ]]; then
+        log "egress check got no answer: tunnel closed until verified"
+        G_EGRESS_OK=0
+      fi
+      guard_sync_rules || true
+    fi
+  fi
+
+  if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
+  G_PF_RULES=$(pf_rule_count)
+  if pf_anchor_reachable; then G_PF_REACHABLE=1; else G_PF_REACHABLE=0; fi
+  G_CONFLICT=$(pf_conflicts | head -3 | paste -sd ';' -)
+  pf_rules_live || G_ERROR=${G_ERROR:-"anchor rules missing"}
+}
+
+guard_init() {
+  mkdir -p "$STATE_DIR" "$RUN_DIR"
+  chmod 755 "$STATE_DIR" "$RUN_DIR"
+  G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0
+  G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
+  G_ENTRY=unknown G_ENTRY_AT=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
+  # A restarted guard must not reset connections again within one boot.
+  G_ARMED=0
+  if [[ -e $RUN_DIR/armed ]] && pf_rules_live; then G_ARMED=1; fi
+}
+
+cmd_guard() {
+  require_root
+  load_config
+  guard_init
+  # Stopping the guard leaves the rules in place on purpose: fail closed.
+  trap 'log "guard stopped"; exit 0' TERM INT
+  log "guard $VERSION started, mode $(read_mode)"
+  while :; do
+    guard_tick
+    write_state
+    sleep "$TICK" &
+    wait $! || true
+  done
+}
+
+# ---------------------------------------------------------------- ssh
+
+# Fills SSH_ARGS with the full ssh command line for the current network.
+build_ssh_args() {
+  local iface=$1 identity=${SSH_IDENTITY/#\~/$HOME}
+  local common="-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+  SSH_ARGS=(ssh -NT -p "$SSH_PORT" -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none)
+  # shellcheck disable=SC2206
+  SSH_ARGS+=($common)
+  [[ -z $identity ]] || SSH_ARGS+=(-i "$identity")
+  if [[ -n $JUMP_HOST ]]; then
+    # Only the outer hop touches the physical network, so it gets -B.
+    SSH_ARGS+=(-o "ProxyCommand=/usr/bin/ssh -B $iface -p $JUMP_PORT $common${identity:+ -i $identity} -W %h:%p $JUMP_USER@$JUMP_HOST")
+  else
+    SSH_ARGS+=(-B "$iface")
+  fi
+  SSH_ARGS+=("${FORWARD_ARGS[@]}" "$SSH_USER@$SSH_HOST")
+}
+
+cmd_ssh_run() {
+  [[ $EUID != 0 ]] || die "ssh-run must run as your user, so ssh uses your key"
+  load_config
+  local iface
+  # While tunlock is off, hold no port: other tools may use it. "off"
+  # restarts this job, so a running ssh stops and lands here.
+  if [[ $(read_mode) != protected ]]; then
+    log "tunlock is off: SSH forward idle"
+    while [[ $(read_mode) != protected ]]; do sleep 2; done
+    log "tunlock is on: starting SSH forward"
+  fi
+  # A new SSH connection must use the physical route, not the tunnel it feeds.
+  iface=$(physical_iface)
+  if [[ -z $iface ]]; then
+    log "no physical IPv4 default route"
+    sleep 5
+    exit 1
+  fi
+  local identity=${SSH_IDENTITY/#\~/$HOME}
+  # The macOS agent starts empty after login; load the key from Keychain.
+  if [[ -n $identity ]] && ! ssh-add -l >/dev/null 2>&1; then
+    ssh-add --apple-use-keychain "$identity" </dev/null >/dev/null 2>&1 || true
+  fi
+  build_ssh_args "$iface"
+  log "ssh to $SSH_HOST:$SSH_PORT${JUMP_HOST:+ through $JUMP_HOST:$JUMP_PORT} via $iface"
+  exec "${SSH_ARGS[@]}"
+}
+
+# ---------------------------------------------------------------- cli
+
+require_root() { [[ $EUID == 0 || -n ${TUNLOCK_TEST_PATH:-} ]] || die "run with sudo"; }
+
+# Test-only commands must never touch the real system: refuse root outright
+# (stubs are disabled for root) and insist on the stub path.
+test_only() {
+  [[ $EUID != 0 ]] || die "test-only command refused as root"
+  [[ -n ${TUNLOCK_TEST_PATH:-} ]] || die "test only"
+}
+
+# With the optional sudoers entry, mode switches need no password.
+elevate() {
+  [[ $EUID == 0 || -n ${TUNLOCK_TEST_PATH:-} ]] && return 0
+  exec sudo "$(readlink -f "${BASH_SOURCE[0]}")" "$@"
+}
+
+state_get() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$RUN_DIR/state" 2>/dev/null; }
+
+guard_running() {
+  [[ -z ${TUNLOCK_TEST_PATH:-} ]] || return "${TUNLOCK_TEST_NO_GUARD:-0}"
+  launchctl print "system/$GUARD_LABEL" >/dev/null 2>&1
+}
+
+# One verdict from the guard's state file, the same rules the app uses:
+#   protected    pf holds our rules and the tunnel exit is verified
+#   blocked      pf holds our rules, no verified tunnel: nothing leaves
+#   direct       direct mode, no kill switch
+#   unprotected  protected mode, but pf state is not confirmed (or an error)
+#   unknown      no fresh state: the guard is not running
+compute_verdict() {
+  [[ -r $RUN_DIR/state ]] || { echo unknown; return; }
+  local updated mode phase pfe pfr reach err conflict
+  updated=$(state_get updated); mode=$(state_get mode); phase=$(state_get phase)
+  pfe=$(state_get pf_enabled); pfr=$(state_get pf_rules); reach=$(state_get pf_reachable)
+  err=$(state_get error); conflict=$(state_get pf_conflict)
+  if (( $(date +%s) - ${updated:-0} > 10 )); then echo unknown
+  elif [[ $mode == direct ]]; then
+    [[ -z $err ]] && echo direct || echo error
+  elif [[ $pfe == 1 && $reach == 1 && ${pfr:-0} -gt 0 && -z $err && -z $conflict ]]; then
+    case $phase in
+      open) echo protected ;;
+      block | probe) echo blocked ;;
+      *) echo unprotected ;;
+    esac
+  else echo unprotected
+  fi
+}
+
+# Asks the guard for a mode and waits for its answer to this very request:
+# a fresh id is written after the mode, and only a state that echoes it
+# counts. A snapshot written before the command, however fresh, never does.
+request_mode() { # mode limit
+  local id i
+  id=$(date +%s)-$$-$RANDOM
+  mkdir -p "$STATE_DIR"
+  (umask 022; echo "$1" > "$STATE_DIR/mode"; echo "$id" > "$STATE_DIR/request.tmp")
+  mv -f "$STATE_DIR/request.tmp" "$STATE_DIR/request"
+  for (( i = 0; i < $2; i++ )); do
+    [[ $(state_get ack) == "$id" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_limit() { [[ -n ${TUNLOCK_TEST_PATH:-} ]] && echo "${TUNLOCK_TEST_WAIT:-3}" || echo "$1"; }
+
+# Exit 0 only when the guard answered this request with a confirmed
+# protected or blocked state.
+cmd_protect() {
+  elevate protect "$@"
+  load_config
+  local v i limit
+  limit=$(wait_limit 25)
+  guard_running || die "the guard is not running: run install.sh"
+  echo "Protected mode on. Waiting for the guard to confirm..."
+  if ! request_mode protected "$limit"; then
+    cmd_status || true
+    echo "tunlock: the guard did not answer this request; protection NOT confirmed" >&2
+    return 1
+  fi
+  for (( i = 0; i < limit; i++ )); do
+    [[ $(compute_verdict) == protected ]] && break
+    sleep 1
+  done
+  v=$(compute_verdict)
+  # Rules confirmed first, so the TUN client can only come up behind them.
+  if [[ ( $v == protected || $v == blocked ) && -n $TUN_SERVICE ]]; then
+    as_console_user scutil --nc start "$TUN_SERVICE" >/dev/null 2>&1 || true
+    echo "Started $TUN_SERVICE. Waiting for a verified tunnel..."
+    for (( i = 0; i < limit + 10; i++ )); do
+      [[ $(compute_verdict) == protected ]] && break
+      sleep 1
+    done
+    v=$(compute_verdict)
+  fi
+  cmd_status || true
+  case $v in
+    protected) return 0 ;;
+    blocked) echo "Kill switch confirmed; the tunnel is not verified yet, so nothing leaves." ; return 0 ;;
+    *) echo "tunlock: protection NOT confirmed ($v)" >&2; return 1 ;;
+  esac
+}
+
+# Exit 0 only when the guard answered this request with direct mode.
+cmd_direct() {
+  elevate direct "$@"
+  load_config
+  local limit
+  limit=$(wait_limit 10)
+  if ! guard_running; then
+    (umask 022; mkdir -p "$STATE_DIR"; echo direct > "$STATE_DIR/mode")
+    if pf_release; then
+      stop_keeper_and_service
+      echo "Guard not running; rules removed directly."
+      return 0
+    fi
+    echo "tunlock: guard not running and pf did not remove the rules; direct mode NOT confirmed" >&2
+    return 1
+  fi
+  if ! request_mode direct "$limit"; then
+    cmd_status || true
+    echo "tunlock: the guard did not answer this request; direct mode NOT confirmed" >&2
+    return 1
+  fi
+  [[ $(compute_verdict) == direct ]] || { cmd_status || true; echo "tunlock: direct mode NOT confirmed" >&2; return 1; }
+  # Off means off: free the SSH port and stop the TUN client.
+  stop_keeper_and_service
+  cmd_status || true
+}
+
+# The logged-in user owns the SSH keeper and the TUN client.
+console_uid() { echo "${SUDO_UID:-$(stat -f %u /dev/console)}"; }
+as_console_user() { local uid; uid=$(console_uid); sudo -u "#$uid" -- "$@"; }
+
+stop_keeper_and_service() {
+  local uid
+  uid=$(console_uid)
+  # Restarted, the keeper sees mode off and idles without holding the port.
+  launchctl kickstart -k "gui/$uid/$SSH_LABEL" >/dev/null 2>&1 || true
+  if [[ -n $TUN_SERVICE ]]; then as_console_user scutil --nc stop "$TUN_SERVICE" >/dev/null 2>&1 || true; fi
+}
+
+age() { local s=$1; (( s < 120 )) && echo "${s}s" || echo "$((s / 60))m"; }
+
+cmd_status() {
+  local porcelain=0
+  [[ ${1:-} == --porcelain ]] && porcelain=1
+  load_config >/dev/null
+  if [[ ! -r $RUN_DIR/state ]]; then
+    (( porcelain )) && { echo "verdict=unknown"; return 3; }
+    echo "No state from the guard. Is it installed and running? (tunlock doctor)"
+    return 3
+  fi
+  local now updated mode phase tun ssh eip eok eat pfe pfr err verdict stale=0
+  now=$(date +%s)
+  updated=$(state_get updated); mode=$(state_get mode); phase=$(state_get phase)
+  tun=$(state_get tun); ssh=$(state_get ssh); eip=$(state_get egress_ip)
+  eok=$(state_get egress_ok); eat=$(state_get egress_at); pfe=$(state_get pf_enabled)
+  pfr=$(state_get pf_rules); err=$(state_get error)
+  (( now - ${updated:-0} <= 10 )) || stale=1
+  verdict=$(compute_verdict)
+
+  if (( porcelain )); then
+    cat "$RUN_DIR/state"
+    echo "stale=$stale"
+    echo "verdict=$verdict"
+    status_code "$verdict"
+    return
+  fi
+  local e_line="none"
+  [[ -n $eip ]] && e_line="$eip ($( [[ $eok == 1 ]] && echo verified || echo NOT expected ), $(age $((now - eat))) ago)"
+  printf '%-8s %s\n' Mode "$mode"
+  if [[ $(state_get cascade) == 1 ]]; then
+    printf '%-8s %s\n' Entry "$(state_get entry_up)  $(state_get entry) (cascade)"
+  fi
+  printf '%-8s %s\n' SSH "$ssh  $(state_get ssh_endpoint)"
+  printf '%-8s %s\n' Egress "$e_line  expected $(state_get expected)${tun:+  via $tun}"
+  printf '%-8s %s\n' PF "phase $phase, pf $( [[ $pfe == 1 ]] && echo enabled || echo disabled ), $pfr rules in $(state_get pf_anchor)"
+  [[ -z $(state_get bypass) ]] || printf '%-8s %s\n' Direct "$(state_get bypass) (around the tunnel)"
+  [[ -z $err ]] || printf '%-8s %s\n' Error "$err"
+  [[ -z $(state_get pf_conflict) ]] || printf '%-8s %s\n' Conflict "$(state_get pf_conflict)"
+  [[ -z $(state_get warning) ]] || printf '%-8s %s\n' Warning "$(state_get warning)"
+  case $verdict in
+    protected) echo "=> PROTECTED: traffic leaves only through the verified tunnel" ;;
+    blocked) echo "=> BLOCKED: no verified tunnel, direct traffic is dropped" ;;
+    direct) echo "=> DIRECT: no kill switch, traffic leaves through your normal connection" ;;
+    unprotected) echo "=> NOT PROTECTED: protected mode is on but tunlock's pf rules are not (alone) in force" ;;
+    error) echo "=> SWITCH FAILED: direct mode was asked, but tunlock rules could not be removed" ;;
+    unknown) echo "=> UNKNOWN: guard state is $(age $((now - ${updated:-0}))) old; is the guard running?" ;;
+  esac
+  status_code "$verdict"
+}
+
+# 0 for a confirmed state (protected, blocked, direct), 1 unprotected, 3 unknown.
+status_code() { case $1 in unprotected | error) return 1 ;; unknown) return 3 ;; *) return 0 ;; esac; }
+
+# Live leak test. Every line is PASS (behaved as required), FAIL (leak or
+# broken tunnel), SKIP (could not be checked here) or INFO (direct mode:
+# reference only). The last line is RESULT=pass|fail|incomplete|baseline.
+# A required check that could not run makes the result incomplete, never pass.
+cmd_test() {
+  require_root
+  load_config
+  local phys mode ip r fails=0 missing=0 skipped=0 has6=0
+  phys=$(physical_iface)
+  mode=$(read_mode)
+  echo "Mode: $mode, physical interface: ${phys:-none}, expected egress: $EXPECTED_EGRESS"
+  reach() { curl -gsS --noproxy '*' --connect-timeout 3 --max-time 5 -o /dev/null "$@" >/dev/null 2>&1; }
+  trace() { curl -fsS --noproxy '*' --connect-timeout 4 --max-time 6 "$@" 2>/dev/null | awk -F= '$1 == "ip" { print $2 }'; }
+  line() { printf '%-5s %-48s %s\n' "$1" "$2" "${3:-}"; }
+  check() { # label want(ok|fail) got(ok|fail) detail
+    if [[ $mode != protected ]]; then line INFO "$1" "$3${4:+ ($4)}"
+    elif [[ $2 == "$3" ]]; then line PASS "$1" "$3${4:+ ($4)}"
+    else line FAIL "$1" "$3${4:+ ($4)}"; fails=$((fails + 1))
+    fi
+  }
+  skip() { # label reason required(1|0)
+    line SKIP "$1" "$2"
+    skipped=$((skipped + 1))
+    [[ ${3:-0} == 1 && $mode == protected ]] && missing=$((missing + 1))
+    return 0
+  }
+
+  if [[ $mode == protected ]]; then
+    pf_enabled && pf_has_label "$(pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | awk -F'"' '/label "tunlock-/ { print $2 }')" \
+      && r=ok || r=fail
+    check "pf enabled, tunlock rules loaded" ok "$r"
+    local conflict
+    conflict=$(pf_conflicts | head -1)
+    [[ -z $conflict ]] && r=ok || r=fail
+    check "no other pf rules decide before tunlock" ok "$r" "$conflict"
+  fi
+  ip=$(trace -4 --interface "$TUN_ADDR" "$PROBE_URL" || true)
+  [[ $ip == "$EXPECTED_EGRESS" ]] && r=ok || r=fail
+  check "tunnel HTTPS by IP ($PROBE_IP)" ok "$r" "${ip:-no answer}"
+  ip=$(trace -4 https://www.cloudflare.com/cdn-cgi/trace || true)
+  [[ $ip == "$EXPECTED_EGRESS" ]] && r=ok || r=fail
+  check "HTTPS by name, system DNS and route" ok "$r" "${ip:-no answer}"
+
+  if [[ -z $phys ]]; then
+    skip "direct IPv4 / UDP / IPv6" "no Wi-Fi or Ethernet connection" 1
+  else
+    reach -4 --interface "$phys" https://1.1.1.1/ && r=ok || r=fail
+    check "direct IPv4 TCP on $phys, no DNS" fail "$r"
+    # A raw DNS query for example.com over UDP, forced onto the physical link.
+    local query='\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+    [[ $(printf '%b' "$query" | nc -u -b "$phys" -w 2 1.1.1.1 53 2>/dev/null | wc -c) -gt 0 ]] && r=ok || r=fail
+    check "direct UDP DNS to 1.1.1.1 on $phys" fail "$r"
+    ifconfig "$phys" | awk '$1 == "inet6" && $2 !~ /^fe80/ { f = 1 } END { exit !f }' && has6=1
+    if (( has6 )); then
+      reach -6 --interface "$phys" 'https://[2606:4700:4700::1111]/' && r=ok || r=fail
+      check "direct IPv6 on $phys" fail "$r"
+      reach -6 'https://[2606:4700:4700::1111]/' && r=ok || r=fail
+      check "IPv6 over the default route" fail "$r"
+    else
+      skip "IPv6" "no IPv6 address on $phys: run again on a network with IPv6"
+    fi
+  fi
+
+  if [[ $mode != protected ]]; then
+    echo "Direct mode: reference only. Note whether IPv6 works here; on such a network,"
+    echo "run the test again in protected mode to prove IPv6 is blocked."
+    echo "RESULT=baseline"
+    return 0
+  fi
+  echo "SKIPPED=$skipped"
+  if (( fails )); then echo "RESULT=fail"; return 1; fi
+  if (( missing )); then echo "RESULT=incomplete"; return 3; fi
+  echo "RESULT=pass"
+}
+
+cmd_doctor() {
+  local ok=1
+  item() { printf '%-4s %s\n' "$1" "$2"; [[ $1 == ok ]] || ok=0; }
+  if (load_config) 2>/dev/null; then item ok "config $CONF"; else
+    item bad "config: $( (load_config) 2>&1 || true)"; return 1
+  fi
+  load_config
+  guard_running && item ok "guard running ($GUARD_LABEL)" || item bad "guard not loaded ($GUARD_LABEL)"
+  local u=${SUDO_UID:-$EUID}
+  if launchctl print "gui/$u/$SSH_LABEL" >/dev/null 2>&1; then item ok "ssh agent loaded ($SSH_LABEL)"
+  else item bad "ssh agent not loaded for uid $u ($SSH_LABEL)"; fi
+  ssh_up && item ok "forward listening on $HEALTH_HOST:$HEALTH_PORT" \
+    || item bad "nothing listens on $HEALTH_HOST:$HEALTH_PORT"
+  local tun
+  tun=$(find_tun || true)
+  [[ -n $tun ]] && item ok "TUN $TUN_ADDR on $tun" || item bad "no utun with $TUN_ADDR (TUN client off?)"
+  local kh="$HOME/.ssh/known_hosts"
+  if [[ -n ${SUDO_USER:-} ]]; then
+    kh=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory | awk '{ print $2 }')/.ssh/known_hosts
+  fi
+  local h hosts=$SSH_HOST
+  [[ -z $JUMP_HOST ]] || hosts="$JUMP_HOST $SSH_HOST"
+  for h in $hosts; do
+    if ssh-keygen -F "$h" -f "$kh" >/dev/null 2>&1 || ssh-keygen -F "[$h]:$SSH_PORT" -f "$kh" >/dev/null 2>&1 \
+      || ssh-keygen -F "[$h]:$JUMP_PORT" -f "$kh" >/dev/null 2>&1; then
+      item ok "host key for $h is in known_hosts"
+    else item bad "no host key for $h in $kh (StrictHostKeyChecking is on)"; fi
+  done
+  entry_up && item ok "SSH entry $ENTRY_HOST:$ENTRY_PORT reachable outside the tunnel" \
+    || item bad "SSH entry $ENTRY_HOST:$ENTRY_PORT not reachable outside the tunnel"
+  if [[ $EUID == 0 ]]; then
+    pf_anchor_reachable && item ok "root pf ruleset reaches $PF_ANCHOR" \
+      || item bad "root pf ruleset does not reach $PF_ANCHOR"
+  else
+    echo "--   run with sudo to check pf"
+  fi
+  (( ok ))
+}
+
+cmd_config() {
+  local key
+  for key in $CONFIG_KEYS PROBE_IP HEALTH_HOST HEALTH_PORT ENTRY_HOST ENTRY_PORT; do echo "$key=${!key}"; done
+  echo "TUN_IFACE=$(find_tun || true)"
+}
+
+usage() {
+  cat <<EOF
+tunlock $VERSION: SSH tunnel keeper with a pf kill switch for macOS
+
+  tunlock on          protect: rules first, then SSH and the TUN client; fails closed
+  tunlock off         everything off: no rules, SSH port freed, TUN client stopped
+                      (protect / direct are the same commands)
+  tunlock status      SSH, verified egress IP and pf state  [--porcelain]
+  tunlock test        live leak test (sudo)
+  tunlock doctor      check the installation
+  tunlock config      print the effective configuration
+  tunlock ssh-command print the ssh command the keeper runs, change nothing
+  tunlock render-rules block|probe|open [utunN [enN]]   print pf rules, change nothing
+
+Config: $CONF
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  shift || true
+  case $cmd in
+    protect | on) cmd_protect "$@" ;;
+    direct | off) cmd_direct "$@" ;;
+    status) cmd_status "$@" ;;
+    test) cmd_test "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    guard) cmd_guard ;;
+    cleanup) cmd_cleanup ;;
+    _guard-ticks)  # tests: run N guard ticks against stubs, then stop
+      test_only
+      load_config; guard_init
+      for (( n = 0; n < ${1:-1}; n++ )); do
+        guard_tick; write_state
+        [[ -z ${TUNLOCK_TEST_BETWEEN:-} ]] || "$TUNLOCK_TEST_BETWEEN" "$n"
+      done ;;
+    _sync-resolvers) test_only; load_config; G_WARNING=''; sync_resolvers; echo "warning=$G_WARNING" ;;  # tests
+    ssh-run) cmd_ssh_run ;;
+    ssh-command) load_config; build_ssh_args "$(physical_iface)"; printf '%q ' "${SSH_ARGS[@]}"; echo ;;
+    render-rules) load_config; render_rules "${1:-block}" "${2:-}" "${3-$(physical_iface)}" ;;
+    config) load_config; cmd_config ;;
+    version | --version) echo "tunlock $VERSION" ;;
+    help | -h | --help | '') usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

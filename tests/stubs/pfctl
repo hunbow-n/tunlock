@@ -1,0 +1,45 @@
+#!/bin/bash
+# pfctl stand-in. State lives in $STUB: anchor rules, enabled flag, failure switches.
+anchor='' op='' arg=''
+while (( $# )); do
+  case $1 in
+    -a) anchor=$2; shift ;;
+    -f) op=load; arg=$2; shift ;;
+    -F) op=flush; arg=$2; shift ;;
+    -s) op=show; arg=$2; shift ;;
+    -sr) op=show; arg=rules ;;
+    -E) op=enable ;;
+    -X) op=release; shift ;;
+  esac
+  shift
+done
+# Rules live per anchor: the default one in $STUB/anchor, others beside it.
+store=$STUB/anchor
+[[ -z $anchor || $anchor == com.apple/000.tunlock ]] || store=$STUB/anchor-${anchor//\//_}
+case $op in
+  load)
+    [[ -n $anchor ]] || exit 0
+    # $STUB/pf_fail: empty rejects every load, otherwise only sets matching it.
+    rules=$(cat)
+    if [[ -e $STUB/pf_fail ]] && { [[ ! -s $STUB/pf_fail ]] || grep -qE "$(cat "$STUB/pf_fail")" <<< "$rules"; }; then
+      echo "pfctl: Syntax error in config file: pf rules not loaded" >&2; exit 1
+    fi
+    grep -v '^#' <<< "$rules" > "$store" ;;
+  flush)
+    if [[ $arg == states ]]; then [[ ! -e $STUB/states_fail ]] || exit 1; echo flush >> "$STUB/states.log"
+    else [[ ! -e $STUB/flush_fail ]] || exit 1; : > "$store"; fi ;;
+  show)
+    case $arg in
+      info) [[ -e $STUB/enabled ]] && echo "Status: Enabled for 0 days" || echo "Status: Disabled" ;;
+      rules)
+        if [[ -n $anchor ]]; then [[ ! -e $STUB/read_fail ]] || exit 1; cat "$store" 2>/dev/null
+        elif [[ -s $STUB/root_rules ]]; then cat "$STUB/root_rules"
+        else echo 'anchor "com.apple/*" all'; fi ;;
+      Anchors)
+        [[ ! -e $STUB/anchors_fail ]] || exit 1
+        cat "$STUB/children-${anchor//\//_}" 2>/dev/null || true ;;
+    esac ;;
+  enable) touch "$STUB/enabled"; echo "pf enabled"; echo "Token : 4242" ;;
+  release) [[ ! -e $STUB/release_fail ]] || exit 1; echo released >> "$STUB/release.log" ;;
+esac
+exit 0

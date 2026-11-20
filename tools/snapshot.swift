@@ -1,0 +1,46 @@
+// Renders the app's views to PNG files for docs and review, without a display.
+// Built by tools/snapshot.sh together with the app sources (minus @main).
+import AppKit
+import SwiftUI
+
+@MainActor
+func snapshot<V: View>(_ view: V, _ path: String) {
+    let host = NSHostingView(rootView: view.environmentObject(StatusModel.shared))
+    host.frame = NSRect(origin: .zero, size: host.fittingSize)
+    let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = host
+    window.appearance = NSAppearance(named: ProcessInfo.processInfo.environment["DARK"] == nil ? .aqua : .darkAqua)
+    host.layoutSubtreeIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+    let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds)!
+    host.cacheDisplay(in: host.bounds, to: rep)
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+
+@main
+enum Snapshot {
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let out = CommandLine.arguments[1]
+        UserDefaults.standard.set(isRussian ? "Варшава" : "Warsaw", forKey: HopNames.entryKey)
+        UserDefaults.standard.set(isRussian ? "Амстердам" : "Amsterdam", forKey: HopNames.exitKey)
+        StatusModel.shared.refresh()
+        RunLoop.main.run(until: Date().addingTimeInterval(1.1))
+        StatusModel.shared.refresh()
+        snapshot(MenuView().background(Color(nsColor: .windowBackgroundColor)), out + "-menu.png")
+        snapshot(SettingsView(), out + "-settings.png")
+        StatusModel.shared.testOutput = """
+        Mode: protected, physical interface: en0, expected egress: 203.0.113.10
+        PASS  pf enabled, tunlock rules loaded                 ok
+        PASS  tunnel HTTPS by IP (1.1.1.1)                     ok (203.0.113.10)
+        PASS  HTTPS by name, system DNS and route              ok (203.0.113.10)
+        PASS  direct IPv4 TCP on en0, no DNS                   fail
+        PASS  direct UDP DNS to 1.1.1.1 on en0                 fail
+        SKIP  IPv6                                             no IPv6 address on en0: run again on a network with IPv6
+        SKIPPED=1
+        RESULT=pass
+        """
+        snapshot(LeakTestView().background(Color(nsColor: .windowBackgroundColor)), out + "-leaktest.png")
+    }
+}

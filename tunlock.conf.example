@@ -1,0 +1,45 @@
+# tunlock configuration. Copy to /usr/local/etc/tunlock.conf and edit.
+# Example values use documentation addresses (RFC 5737): replace them.
+
+# Your server. It is the SSH endpoint and, by default, the expected egress IP.
+VPS_IP=203.0.113.10
+SSH_USER=me
+SSH_PORT=22
+# Key to load into the agent after login (optional). Keychain passphrase is used.
+SSH_IDENTITY=~/.ssh/id_ed25519
+
+# What SSH forwards. The first local port is used for the health check.
+#   Shadowsocks/Outline on the server behind SSH:
+#     -L 127.0.0.1:10800:127.0.0.1:8388
+#   Plain SSH dynamic SOCKS (no extra server software):
+#     -D 127.0.0.1:1080
+SSH_FORWARD="-D 127.0.0.1:1080"
+
+# Optional cascade: SSH enters through a relay and reaches VPS_IP from there
+# (ssh ProxyCommand -W). Outside the tunnel only the relay is reachable; the
+# internet still opens only when traffic exits with EXPECTED_EGRESS. Restrict
+# the relay account on its server, e.g. PermitOpen <VPS_IP>:22.
+#JUMP_HOST=198.51.100.7
+#JUMP_USER=relay
+#JUMP_PORT=22
+
+# Exceptions: networks reached directly around the tunnel, any port, also while
+# the tunnel is down (office/home LAN). And DNS servers for chosen domains.
+#BYPASS_NETS="192.168.0.0/24"
+#BYPASS_DNS="corp.example=192.168.0.1"
+
+# IPv4 address your TUN client (Karing, sing-box, ...) puts on its utun
+# interface. The utun number may change; the address must not.
+TUN_ADDR=172.19.0.1
+# Optional: netmask as ifconfig prints it, e.g. 0xfffffffc for /30.
+TUN_MASK=
+
+# Egress check: HTTPS to an IPv4 literal that echoes your address (no DNS).
+# EXPECTED_EGRESS defaults to VPS_IP; set it if the server exits elsewhere.
+#EXPECTED_EGRESS=203.0.113.10
+PROBE_URL=https://1.1.1.1/cdn-cgi/trace
+PROBE_INTERVAL=30
+
+# pf anchor. The default sits under Apple's "com.apple/*" anchor, so tunlock
+# never reloads the root ruleset or touches /etc/pf.conf.
+#PF_ANCHOR=com.apple/000.tunlock

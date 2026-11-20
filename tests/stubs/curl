@@ -1,0 +1,5 @@
+#!/bin/bash
+# Answers the egress probe with $STUB/egress, or times out.
+[[ -s $STUB/egress ]] || exit 28
+echo "ip=$(cat "$STUB/egress")"
+echo "loc=NL"

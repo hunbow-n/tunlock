@@ -1,0 +1,4 @@
+*.conf
+!tests/fixtures/*.conf
+.DS_Store
+build/

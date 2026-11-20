@@ -1,0 +1,3 @@
+#!/bin/bash
+# Records VPN service control.
+echo "$*" >> "$STUB/scutil.log"

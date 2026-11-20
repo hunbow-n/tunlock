@@ -1,0 +1,4 @@
+#!/bin/bash
+# Local forward is up when $STUB/ssh_up exists; the entry is always reachable.
+for a in "$@"; do [[ $a == 10800 ]] && { [[ -e $STUB/ssh_up ]]; exit; }; done
+exit 0

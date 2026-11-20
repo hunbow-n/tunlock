@@ -1,0 +1,3 @@
+#!/bin/bash
+# Records launchd calls.
+echo "$*" >> "$STUB/launchctl.log"

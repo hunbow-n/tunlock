@@ -1,0 +1,16 @@
+#!/bin/bash
+# "ifconfig X down" records X (or fails when $STUB/ifconfig_fail exists).
+# "ifconfig X" prints flags: UP unless X was taken down.
+# Listing all interfaces is served by TUNLOCK_TEST_IFCONFIG, not this stub.
+if [[ ${2:-} == down ]]; then
+  [[ ! -e $STUB/ifconfig_fail ]] || exit 1
+  echo "$1" >> "$STUB/down.log"
+  exit 0
+fi
+[[ ${1:-} != -a ]] || exit 0  # full listing: nothing beyond TUNLOCK_TEST_IFCONFIG
+[[ ! -e $STUB/ifconfig_read_fail ]] || exit 1
+if grep -qxF -- "$1" "$STUB/down.log" 2>/dev/null </dev/null; then
+  echo "$1: flags=8050<POINTOPOINT,RUNNING,MULTICAST> mtu 1500"
+else
+  echo "$1: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500"
+fi

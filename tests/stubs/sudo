@@ -1,0 +1,4 @@
+#!/bin/bash
+# Runs the command after "-u <user> --", like root-run sudo would.
+while [[ $1 == -* ]]; do [[ $1 == -- ]] && { shift; break; }; [[ $1 == -u ]] && shift; shift; done
+exec "$@"
