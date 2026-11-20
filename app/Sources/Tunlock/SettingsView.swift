@@ -3,7 +3,15 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var model: StatusModel
-    @State private var config = TunConfig.loadInstalled() ?? TunConfig()
+    @State private var config = TunConfig.loadDraft() ?? TunConfig.loadInstalled() ?? TunConfig()
+    /// The draft version shown in this form (nil: the installed config).
+    @State private var loadedDraft: String? = try? String(contentsOfFile: Paths.draft, encoding: .utf8)
+    private var fromAgent: Bool { loadedDraft != nil }
+    /// A newer draft than the one in the form arrived.
+    private var newerDraft: String? {
+        guard let id = model.draftID, id != loadedDraft else { return nil }
+        return id
+    }
     @State private var passwordless = FileManager.default.fileExists(atPath: Paths.sudoers)
         || !FileManager.default.fileExists(atPath: Paths.config)
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -13,6 +21,14 @@ struct SettingsView: View {
     @State private var seenIP: String?
     @State private var seenCountry = ""
     @State private var tab: Tab
+    /// Agent drafts open on a one-screen review; the full tabs are one click away.
+    @State private var showAllSettings = false
+    @State private var applyStage: ApplyStage = .idle
+
+    enum ApplyStage: Equatable {
+        case idle, saving, turningOn
+        case done(text: String, success: Bool)
+    }
     @AppStorage("notify") private var notify = true
     @State private var proxyCheck: Check = .idle
     @State private var saving = false
@@ -34,7 +50,20 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !model.installed { welcome }
+            if let draft = newerDraft { newDraftBanner(draft) }
+            if fromAgent, !showAllSettings {
+                draftReview
+            } else {
+                if fromAgent { agentDraftBanner } else if !model.installed, newerDraft == nil { welcome }
+                fullSettings
+            }
+        }
+        .frame(width: 600, height: 620)
+        .onChange(of: config) { _ in saved = false }
+    }
+
+    @ViewBuilder
+    private var fullSettings: some View {
             TabView(selection: $tab) {
                 Form {
                     upstreamSection
@@ -62,12 +91,213 @@ struct SettingsView: View {
             .padding(.top, 8)
             Divider()
             bottomBar.padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    // MARK: agent draft review
+
+    /// "The agent set it up, I confirm": the few facts that matter, one button.
+    private var draftReview: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "sparkles").font(.system(size: 26)).foregroundStyle(.purple)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L("The AI agent prepared Tunlock", "ИИ-агент подготовил Tunlock")).font(.title3.weight(.semibold))
+                    Text(L("Check these points. Nothing is applied until you press the button below.",
+                           "Проверьте эти пункты. Ничего не применится, пока вы не нажмёте кнопку внизу."))
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Form {
+                Section {
+                    LabeledContent(L("Connection", "Подключение"), value: connectionSummary)
+                    LabeledContent(L("TUN app", "TUN-приложение")) { tunSummary }
+                    LabeledContent(L("Expected exit", "Ожидаемый выход"), value: config.exitDescription)
+                    LabeledContent(L("Exit right now", "Выход сейчас")) {
+                        HStack(spacing: 8) {
+                            checkLabel(ipCheck)
+                            Button(L("Check", "Проверить"), action: checkIP)
+                                .disabled(config.tunAddr.isEmpty || ipCheck == .running)
+                        }
+                    }
+                    if let ip = seenIP, !config.exitMatches(ip: ip, country: seenCountry) {
+                        Button(L("Pin this exit instead: \(ip) \(flagEmoji(seenCountry))",
+                                 "Закрепить вместо этого выход: \(ip) \(flagEmoji(seenCountry))"), action: pinSeen)
+                    }
+                }
+                if !config.extras.isEmpty {
+                    Section {
+                        ForEach(config.extras, id: \.key) { LabeledContent($0.key, value: $0.value) }
+                    } header: {
+                        Text(L("Advanced settings (kept from your config)", "Расширенные параметры (сохранены из вашего конфига)"))
+                    }
+                }
+                Section {
+                    if config.bypassNets.isEmpty && config.bypassDNS.isEmpty {
+                        Text(L("Nothing: every connection goes through the tunnel.", "Ничего: все соединения идут через туннель."))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(config.bypassNets, id: \.self) { Label($0, systemImage: "network") }
+                    ForEach(config.bypassDNS) { Label("\($0.domain) → \($0.server)", systemImage: "character.cursor.ibeam") }
+                } header: {
+                    Text(L("Goes directly, around the tunnel", "Пойдёт напрямую, мимо туннеля"))
+                }
+            }
+            .formStyle(.grouped)
+            .onAppear { if ipCheck == .idle, !config.tunAddr.isEmpty { checkIP() } }
+
+            Divider()
+            HStack(spacing: 12) {
+                switch applyStage {
+                case .idle:
+                    Button(L("All settings…", "Все настройки…")) { showAllSettings = true }
+                    Button(L("Discard", "Отклонить")) {
+                        removeDraft(ifStill: loadedDraft)
+                        loadedDraft = nil
+                        config = TunConfig.loadInstalled() ?? TunConfig()
+                        resetCheck()
+                    }
+                    Spacer()
+                    if let blocker = saveBlocker {
+                        Text(blocker.text).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                    Button(L("Apply and turn on", "Применить и включить"), action: applyAndTurnOn)
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(saveBlocker != nil)
+                case .saving, .turningOn:
+                    ProgressView().controlSize(.small)
+                    Text(applyStage == .saving
+                         ? L("Saving and installing the service…", "Сохраняю и устанавливаю службу…")
+                         : L("Turning on: firewall, then the tunnel, then checking the exit…", "Включаю: файрвол, затем туннель, затем проверка выхода…"))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                case .done(let text, let success):
+                    Label(text, systemImage: success ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(success ? .green : .orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button(success ? L("Done", "Готово") : L("Back", "Назад")) {
+                        if success { loadedDraft = nil; Windows.shared.close("settings") } else { applyStage = .idle }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 12)
         }
-        .frame(width: 600, height: 620)
-        .onChange(of: config) { _ in saved = false }
+    }
+
+    private var connectionSummary: String {
+        if config.isProxy { return L("Proxy ", "Прокси ") + "\(clean(config.proxyHost)):\(clean(config.proxyPort))" }
+        var s = L("Own server ", "Свой сервер ") + clean(config.vpsIP) + L(" over SSH", " по SSH")
+        if config.cascade { s += L(", entering via ", ", вход через ") + clean(config.jumpHost) }
+        return s
+    }
+
+    @ViewBuilder
+    private var tunSummary: some View {
+        let app = config.tunService.isEmpty ? "" : config.tunService + " · "
+        if let t = tuns.first(where: { $0.address == clean(config.tunAddr) }) {
+            Label(app + "\(t.name) · \(t.address)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+        } else {
+            Label(app + clean(config.tunAddr) + L(": not up, turn it on", ": не поднят, включите его"), systemImage: "moon.fill")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    /// Save + install, then turn on, then say how it ended, in one flow.
+    private func applyAndTurnOn() {
+        applyStage = .saving
+        let version = loadedDraft, snapshot = config
+        Task {
+            if let error = await model.apply(snapshot, passwordless: passwordless) {
+                applyStage = .done(text: error, success: false)
+                return
+            }
+            removeDraft(ifStill: version)
+            applyStage = .turningOn
+            // "on" exits 0 only when the guard answered this very request with
+            // protected or blocked; anything else is a failure, whatever the old state says.
+            let r = await model.turnOn()
+            guard r.ok else {
+                let why = r.cancelled ? L("Cancelled: Tunlock was not turned on.", "Отменено: Tunlock не включён.")
+                    : r.output.split(separator: "\n").last { $0.hasPrefix("tunlock:") }.map(String.init)
+                        ?? L("Tunlock could not be turned on.", "Не удалось включить Tunlock.")
+                applyStage = .done(text: why, success: false)
+                return
+            }
+            for _ in 0..<30 where model.verdict != .protected {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                model.refresh()
+            }
+            let s = model.state
+            switch model.verdict {
+            case .protected:
+                let cc = s["egress_country"] ?? ""
+                applyStage = .done(text: L("Protected: exit ", "Защищено: выход ") + "\(s["egress_ip"] ?? "") \(flagEmoji(cc)) \(countryName(cc))",
+                                   success: true)
+            case .blocked:
+                applyStage = .done(text: L("Tunlock is on and waits for a verified exit: the internet stays closed until then. Check that the TUN app is on.",
+                                           "Tunlock включён и ждёт подтверждённого выхода: до этого интернет закрыт. Проверьте, что TUN-приложение включено."),
+                                   success: true)
+            default:
+                let why = r.output.split(separator: "\n").last { $0.hasPrefix("tunlock:") }.map(String.init)
+                applyStage = .done(text: why ?? model.verdict.explanation, success: false)
+            }
+        }
     }
 
     // MARK: sections
+
+    /// The values came from an AI agent: say so, and let the user drop them.
+    private var agentDraftBanner: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "sparkles").font(.system(size: 24)).foregroundStyle(.purple)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L("Draft from an AI agent", "Черновик от ИИ-агента")).font(.headline)
+                Text(L("An agent filled these settings in. Check every tab; nothing is active until you press Save and apply.",
+                       "Эти настройки заполнил агент. Проверьте все вкладки: ничего не действует, пока вы не нажмёте «Сохранить и применить»."))
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button(L("Discard", "Отклонить")) {
+                removeDraft(ifStill: loadedDraft)
+                loadedDraft = nil
+                config = TunConfig.loadInstalled() ?? TunConfig()
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.purple.opacity(0.08))
+    }
+
+    /// A newer draft came in while this form was open: offer it, never swap it in silently.
+    private func newDraftBanner(_ draft: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles").foregroundStyle(.purple)
+            Text(L("The AI agent sent a new draft. Loading it replaces what is in the form now.",
+                   "ИИ-агент прислал новый черновик. Загрузка заменит то, что сейчас в форме."))
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button(L("Load", "Загрузить")) {
+                config = TunConfig.parse(draft)
+                loadedDraft = draft
+                resetCheck()
+            }
+            .disabled(saving || applyStage != .idle)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.purple.opacity(0.14))
+    }
+
+    /// Deletes the draft file only if it is still the version this form handled.
+    private func removeDraft(ifStill version: String?) {
+        guard let version, (try? String(contentsOfFile: Paths.draft, encoding: .utf8)) == version else { return }
+        try? FileManager.default.removeItem(atPath: Paths.draft)
+    }
 
     /// First launch: three steps, one line each, above the tabs.
     private var welcome: some View {
@@ -221,9 +451,16 @@ struct SettingsView: View {
                 if config.exitMode != .country {
                     TextField(L("Exit IP", "Выходной IP"), text: Binding(
                         get: { config.expectedEgress == "any" ? "" : config.expectedEgress },
-                        set: { config.expectedEgress = $0 }),
+                        set: { config.expectedEgress = clean($0) }),
                               prompt: Text(config.isProxy ? (config.proxyHost.isEmpty ? L("same as the proxy", "как у прокси") : config.proxyHost)
                                                           : (config.vpsIP.isEmpty ? L("same as server", "как у сервера") : config.vpsIP)))
+                }
+                if config.exitMode != .country, !config.expectedEgress.isEmpty, config.expectedEgress != "any",
+                   !looksLikeIPv4(config.expectedEgress) {
+                    Label(L("This is not an IPv4 address: check for extra characters.",
+                            "Это не похоже на IPv4-адрес: проверьте, нет ли лишних символов."),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(.orange)
                 }
                 if config.exitMode != .ip {
                     HStack {
@@ -415,7 +652,7 @@ struct SettingsView: View {
                 Text(L("Found \(t.name) · \(t.address). Is it \(app)'s?", "Найден \(t.name) · \(t.address). Это интерфейс \(app)?"))
                     .font(.callout).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
-                Button(L("Yes, use it", "Да, использовать")) { config.tunAddr = t.address; config.tunMask = t.mask }
+                Button(L("Yes, use it", "Да, использовать")) { resetCheck(); config.tunAddr = t.address; config.tunMask = t.mask }
             }
         } else if config.tunAddr.isEmpty {
             Label(L("Several interfaces found: pick \(app)'s in the list. Not sure? Turn \(app) off and on, and see which one appears.",
@@ -467,6 +704,7 @@ struct SettingsView: View {
             get: { config.tunAddr.isEmpty ? "" : config.tunAddr + "|" + config.tunMask },
             set: { value in
                 let parts = value.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                if (parts.first ?? "") != config.tunAddr { resetCheck() }  // a check of the old tunnel means nothing now
                 config.tunAddr = parts.first ?? ""
                 config.tunMask = parts.count > 1 ? parts[1] : ""
             })
@@ -521,26 +759,42 @@ struct SettingsView: View {
         }
     }
 
+    /// Which check is current; results of an older one (another draft, another
+    /// interface) are dropped when they arrive.
+    @State private var checkToken = UUID()
+
     private func checkIP() {
         ipCheck = .running
-        let c = config
+        seenIP = nil
+        seenCountry = ""
+        let c = config, token = UUID()
+        checkToken = token
         Task {
-            let r = await run("/usr/bin/curl", ["-4fsS", "--noproxy", "*", "--interface", c.tunAddr,
-                                                "--connect-timeout", "4", "--max-time", "6", "https://1.1.1.1/cdn-cgi/trace"])
-            let lines = r.output.split(separator: "\n")
-            let ip = lines.first { $0.hasPrefix("ip=") }.map { String($0.dropFirst(3)) }
-            let loc = lines.first { $0.hasPrefix("loc=") }.map { String($0.dropFirst(4)) } ?? ""
-            seenIP = ip
-            seenCountry = loc
-            let seen = ip.map { "\($0) \(flagEmoji(loc)) \(countryName(loc))" } ?? ""
-            if let ip, c.exitMatches(ip: ip, country: loc) {
-                ipCheck = .ok(L("\(seen): matches", "\(seen): совпадает"))
-            } else if ip != nil {
-                ipCheck = .failed(L("\(seen): expected \(c.exitDescription)", "\(seen): ожидается \(c.exitDescription)"))
-            } else {
+            let result = await Task.detached { probeExit(tunAddr: c.tunAddr) }.value
+            guard token == checkToken, clean(config.tunAddr) == clean(c.tunAddr) else { return }
+            switch result {
+            case .notTun:
+                ipCheck = .failed(L("\(clean(c.tunAddr)) is not a TUN interface right now: turn the TUN app on",
+                                    "\(clean(c.tunAddr)) сейчас не TUN-интерфейс: включите TUN-приложение"))
+            case .noAnswer:
                 ipCheck = .failed(L("No answer through the tunnel", "Нет ответа через туннель"))
+            case .seen(let ip, let loc):
+                seenIP = ip
+                seenCountry = loc
+                let seen = "\(ip) \(flagEmoji(loc)) \(countryName(loc))"
+                ipCheck = c.exitMatches(ip: ip, country: loc)
+                    ? .ok(L("\(seen): matches", "\(seen): совпадает"))
+                    : .failed(L("\(seen): expected \(c.exitDescription)", "\(seen): ожидается \(c.exitDescription)"))
             }
         }
+    }
+
+    /// Forget what was checked: the config it belonged to is gone.
+    private func resetCheck() {
+        checkToken = UUID()
+        ipCheck = .idle
+        seenIP = nil
+        seenCountry = ""
     }
 
     private func checkProxy() {
@@ -556,10 +810,16 @@ struct SettingsView: View {
     private func save() {
         saving = true
         saveError = nil
+        let version = loadedDraft  // the draft being saved, fixed now: "Load" may change loadedDraft meanwhile
+        let snapshot = config
         Task {
-            saveError = await model.apply(config, passwordless: passwordless)
+            saveError = await model.apply(snapshot, passwordless: passwordless)
             saving = false
             saved = saveError == nil
+            if saved, version != nil {  // that draft is now the real config; a newer one stays
+                removeDraft(ifStill: version)
+                if loadedDraft == version { loadedDraft = nil }
+            }
         }
     }
 }

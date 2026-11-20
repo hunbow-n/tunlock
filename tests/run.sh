@@ -27,7 +27,7 @@ bad_conf() { # name, line to append or replace
 }
 
 if command -v shellcheck >/dev/null; then
-  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh 2>&1); then
+  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh 2>&1); then
     ok shellcheck; else ko shellcheck "$out"; fi
 else echo "skip shellcheck (not installed)"; fi
 

@@ -153,6 +153,38 @@ other country keeps the internet closed.
 
 <br clear="right">
 
+## Let an AI agent set it up (MCP)
+
+<img src="docs/screenshots/en-light-agent.png" width="340" align="right" alt="AI agent window">
+
+Tunlock is also a local [MCP](https://modelcontextprotocol.io) server, so Claude
+Code, Claude Desktop or Cursor can do the setup with you. Click ✨ in the menu
+for a copy-paste, or run:
+
+```bash
+claude mcp add tunlock -- "/Applications/Tunlock.app/Contents/MacOS/Tunlock" --mcp
+```
+
+Then ask: *"Set up Tunlock on my Mac with the tunlock MCP tools."*
+
+| the agent can | the agent cannot |
+|---|---|
+| `status`, `detect` (TUN apps, VPNs, network, exits) | apply settings, turn Tunlock on or off |
+| `check_ssh`, `check_proxy`, `check_exit` | uninstall or touch the firewall |
+| `validate_config`, `propose_config` | see passwords or SSH keys |
+
+A proposed config is only a **draft**. Tunlock opens a one-screen review:
+connection, TUN app, expected exit, a live exit check, and what goes around the
+tunnel. One button, **Apply and turn on**, saves it, turns protection on and
+says how it ended: protected with the verified exit, or on and waiting for one.
+The full settings are one click away. Advanced keys (`PF_ANCHOR`, `PROBE_URL`,
+`SSH_HOST`) cannot be changed through MCP, and `check_exit` only works on a TUN
+interface, so an agent never learns your direct IP. That way a prompt injection cannot talk an agent into
+switching your kill switch off. The server runs on stdio, only while the agent
+uses it; it opens no port.
+
+<br clear="right">
+
 ## Configuration
 
 The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see

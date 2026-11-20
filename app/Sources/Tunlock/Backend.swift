@@ -12,6 +12,9 @@ enum Paths {
     static var sshLog: String { NSHomeDirectory() + "/Library/Logs/tunlock-ssh.log" }
     static var bundled: String { (Bundle.main.resourcePath ?? "") + "/backend" }
     static var bundledCLI: String { bundled + "/bin/tunlock" }
+    /// Where an AI agent's proposed config waits for the user (see MCP.swift).
+    static var draftDir: String { NSHomeDirectory() + "/Library/Application Support/Tunlock" }
+    static var draft: String { ProcessInfo.processInfo.environment["TUNLOCK_UI_DRAFT"] ?? draftDir + "/draft.conf" }
 }
 
 struct RunResult {
@@ -130,10 +133,29 @@ struct TunConfig: Equatable {
     }
 
     var expectedCountry = ""
+    /// Keys the form has no field for (SSH_HOST, PROBE_URL, PF_ANCHOR…), carried
+    /// through unchanged so saving from the app never drops what the file says.
+    var extras: [(key: String, value: String)] = []
+
+    static let modeledKeys: Set<String> = [
+        "UPSTREAM", "PROXY_HOST", "PROXY_PORT", "VPS_IP", "SSH_USER", "SSH_PORT", "SSH_IDENTITY", "SSH_FORWARD",
+        "JUMP_HOST", "JUMP_USER", "JUMP_PORT", "BYPASS_NETS", "BYPASS_DNS", "TUN_ADDR", "TUN_MASK", "TUN_SERVICE",
+        "EXPECTED_EGRESS", "EXPECTED_COUNTRY", "PROBE_INTERVAL",
+    ]
+
+    private var extraLines: [String] { extras.map { "\($0.key)=\"\($0.value)\"" } }
+
+    static func == (a: TunConfig, b: TunConfig) -> Bool {
+        a.render() == b.render()
+    }
 
     var isProxy: Bool { upstream == "proxy" }
     /// The pinned exit IP (empty, or "any" when only the country counts).
-    var effectiveEgress: String { expectedEgress.isEmpty ? (isProxy ? proxyHost : vpsIP) : expectedEgress }
+    /// Pasted values often carry a space or a newline: never compare those.
+    var effectiveEgress: String {
+        let e = clean(expectedEgress)
+        return e.isEmpty ? clean(isProxy ? proxyHost : vpsIP) : e
+    }
 
     /// What counts as "our" exit.
     enum ExitMode: String, CaseIterable, Identifiable {
@@ -164,7 +186,7 @@ struct TunConfig: Equatable {
 
     /// Would the guard accept this probe answer?
     func exitMatches(ip: String, country: String) -> Bool {
-        let ipOK = exitMode == .country || ip == effectiveEgress
+        let ipOK = exitMode == .country || clean(ip) == effectiveEgress
         let countryOK = exitMode == .ip || country.uppercased() == expectedCountry.uppercased()
         return ipOK && countryOK
     }
@@ -182,11 +204,11 @@ struct TunConfig: Equatable {
         if isProxy { return renderProxy() }
         var lines = [
             "# Written by Tunlock.app. See tunlock.conf.example for all options.",
-            "VPS_IP=\(vpsIP)",
-            "SSH_USER=\(sshUser)",
-            "SSH_PORT=\(sshPort)",
+            "VPS_IP=\(clean(vpsIP))",
+            "SSH_USER=\(clean(sshUser))",
+            "SSH_PORT=\(clean(sshPort))",
             "SSH_FORWARD=\"\(forwardString)\"",
-            "TUN_ADDR=\(tunAddr)",
+            "TUN_ADDR=\(clean(tunAddr))",
             "TUN_MASK=\(tunMask)",
             "PROBE_INTERVAL=\(probeInterval)",
             "TUN_SERVICE=\"\(tunService)\"",
@@ -196,12 +218,13 @@ struct TunConfig: Equatable {
         let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
         if !dns.isEmpty { lines.append("BYPASS_DNS=\"\(dns.map { "\($0.domain)=\($0.server)" }.joined(separator: " "))\"") }
         if cascade {
-            lines.append("JUMP_HOST=\(jumpHost)")
+            lines.append("JUMP_HOST=\(clean(jumpHost))")
             lines.append("JUMP_USER=\(jumpUser.isEmpty ? sshUser : jumpUser)")
-            lines.append("JUMP_PORT=\(jumpPort)")
+            lines.append("JUMP_PORT=\(clean(jumpPort))")
         }
-        if !expectedEgress.isEmpty, expectedEgress != vpsIP { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
+        if !expectedEgress.isEmpty, expectedEgress != vpsIP { lines.append("EXPECTED_EGRESS=\(clean(expectedEgress))") }
         if !countryToWrite.isEmpty { lines.append("EXPECTED_COUNTRY=\(countryToWrite)") }
+        lines += extraLines
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -210,9 +233,9 @@ struct TunConfig: Equatable {
             "# Written by Tunlock.app. See tunlock.conf.example for all options.",
             "# The proxy's login and password live only in the TUN app.",
             "UPSTREAM=proxy",
-            "PROXY_HOST=\(proxyHost)",
-            "PROXY_PORT=\(proxyPort)",
-            "TUN_ADDR=\(tunAddr)",
+            "PROXY_HOST=\(clean(proxyHost))",
+            "PROXY_PORT=\(clean(proxyPort))",
+            "TUN_ADDR=\(clean(tunAddr))",
             "TUN_MASK=\(tunMask)",
             "PROBE_INTERVAL=\(probeInterval)",
             "TUN_SERVICE=\"\(tunService)\"",
@@ -220,22 +243,27 @@ struct TunConfig: Equatable {
         if !bypassNets.isEmpty { lines.append("BYPASS_NETS=\"\(bypassNets.joined(separator: " "))\"") }
         let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
         if !dns.isEmpty { lines.append("BYPASS_DNS=\"\(dns.map { "\($0.domain)=\($0.server)" }.joined(separator: " "))\"") }
-        if !expectedEgress.isEmpty, expectedEgress != proxyHost { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
+        if !expectedEgress.isEmpty, expectedEgress != proxyHost { lines.append("EXPECTED_EGRESS=\(clean(expectedEgress))") }
         if !countryToWrite.isEmpty { lines.append("EXPECTED_COUNTRY=\(countryToWrite)") }
+        lines += extraLines
         return lines.joined(separator: "\n") + "\n"
     }
 
     static func parse(_ text: String) -> TunConfig {
         var values: [String: String] = [:]
+        var order: [String] = []
         for raw in text.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
             guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
             var value = String(line[line.index(after: eq)...])
             if let hash = value.range(of: " #") { value = String(value[..<hash.lowerBound]) }
             value = value.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            values[String(line[..<eq])] = value
+            let key = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
+            if values[key] == nil { order.append(key) }
+            values[key] = value
         }
         var c = TunConfig()
+        c.extras = order.filter { !modeledKeys.contains($0) }.map { ($0, values[$0] ?? "") }
         c.vpsIP = values["VPS_IP"] ?? ""
         c.sshUser = values["SSH_USER"] ?? c.sshUser
         c.sshPort = values["SSH_PORT"] ?? "22"
@@ -274,6 +302,11 @@ struct TunConfig: Equatable {
         return c
     }
 
+    static func loadDraft() -> TunConfig? {
+        guard let text = try? String(contentsOfFile: Paths.draft, encoding: .utf8) else { return nil }
+        return parse(text)
+    }
+
     static func loadInstalled() -> TunConfig? {
         guard let text = try? String(contentsOfFile: Paths.config, encoding: .utf8) else { return nil }
         return parse(text)
@@ -306,4 +339,41 @@ func vpnServices() -> [String] {
         guard let a = line.firstIndex(of: "\""), let b = line[line.index(after: a)...].firstIndex(of: "\"") else { return nil }
         return String(line[line.index(after: a)..<b])
     }
+}
+
+/// Trims spaces and line breaks that come with pasted addresses.
+func clean(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+func looksLikeIPv4(_ s: String) -> Bool {
+    let p = clean(s).split(separator: ".", omittingEmptySubsequences: false)
+    return p.count == 4 && p.allSatisfy { Int($0).map { (0...255).contains($0) } ?? false }
+}
+
+/// The one exit check for the app and for MCP. Only an address that sits on a
+/// utun right now, and the request is bound to that interface by name: a Wi-Fi
+/// address can never reveal the direct IP. Blocking; call off the main thread.
+enum ExitProbe: Equatable {
+    case notTun
+    case noAnswer
+    case seen(ip: String, country: String)
+}
+
+func probeExit(tunAddr: String) -> ExitProbe {
+    guard let tun = tunInterfaces().first(where: { $0.address == clean(tunAddr) }) else { return .notTun }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+    p.arguments = ["-4fsS", "--noproxy", "*", "--interface", "if!\(tun.name)",
+                   "--connect-timeout", "4", "--max-time", "6", "https://1.1.1.1/cdn-cgi/trace"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return .noAnswer }
+    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    p.waitUntilExit()
+    var ip = "", cc = ""
+    for line in out.split(separator: "\n") {
+        if line.hasPrefix("ip=") { ip = String(line.dropFirst(3)) }
+        if line.hasPrefix("loc=") { cc = String(line.dropFirst(4)) }
+    }
+    return ip.isEmpty ? .noAnswer : .seen(ip: ip, country: cc)
 }

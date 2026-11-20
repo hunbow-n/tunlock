@@ -11,6 +11,15 @@ final class Windows {
         show("settings", title: L("Tunlock Settings", "Настройки Tunlock")) { SettingsView() }
     }
 
+    func close(_ id: String) {
+        windows[id]?.close()
+        windows[id] = nil
+    }
+
+    func showAgent() {
+        show("agent", title: L("AI agent (MCP)", "ИИ-агент (MCP)")) { AgentView() }
+    }
+
     func showLeakTest() {
         windows["leaktest"]?.close()
         windows["leaktest"] = nil

@@ -56,8 +56,12 @@ struct MenuView: View {
             Divider()
             footer
         }
-        .padding(16)
+        .padding(Shape.panelPadding)
+        // The footer sits in the panel's rounded corners: give it room so the
+        // corner curve never clips "Settings…" or "Quit".
+        .padding(.bottom, Shape.footerInset)
         .frame(width: 340)
+        .background(PanelChrome())
     }
 
     @State private var confirmPin = false
@@ -90,9 +94,9 @@ struct MenuView: View {
                            "Только если вы сами сменили сервер или прокси. Если нет, на пути чужой выход: оставьте интернет закрытым."))
                 }
         }
-        .padding(10)
+        .padding(Shape.cardPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+        .background(Shape.card().fill(Color.orange.opacity(0.12)))
     }
 
     // MARK: header
@@ -150,13 +154,12 @@ struct MenuView: View {
             }
             Spacer()
             Toggle("", isOn: Binding(get: { on }, set: { model.setMode($0) }))
-                .toggleStyle(.switch)
-                .controlSize(.large)
+                .toggleStyle(PowerSwitchStyle(busy: model.busy != nil))
                 .labelsHidden()
                 .disabled(model.busy != nil)
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill((on ? Color.green : Color.primary).opacity(on ? 0.12 : 0.05)))
+        .padding(Shape.cardPadding)
+        .background(Shape.card().fill((on ? Color.green : Color.primary).opacity(on ? 0.12 : 0.05)))
     }
 
     // MARK: route
@@ -281,9 +284,9 @@ struct MenuView: View {
 
     private func card<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         content()
-            .padding(10)
+            .padding(Shape.cardPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+            .background(Shape.card().fill(Color.primary.opacity(0.05)))
     }
 
     private var footer: some View {
@@ -294,6 +297,10 @@ struct MenuView: View {
                     .disabled(model.busy != nil)
             }
             Spacer()
+            Button {
+                Windows.shared.showAgent()
+            } label: { Image(systemName: "sparkles") }
+                .help(L("Let an AI agent set Tunlock up (MCP)", "Настроить Tunlock через ИИ-агента (MCP)"))
             Button(L("Quit", "Выйти")) { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
                 .help(L("Protection keeps working without the app", "Защита продолжит работать без приложения"))

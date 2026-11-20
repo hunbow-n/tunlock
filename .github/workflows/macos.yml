@@ -32,6 +32,9 @@ jobs:
           [[ " $architectures " == *" arm64 "* && " $architectures " == *" x86_64 "* ]]
           codesign --verify --deep --strict build/Tunlock.app
 
+      - name: MCP server answers like an agent expects
+        run: bash tests/mcp.sh build/Tunlock.app/Contents/MacOS/Tunlock
+
       - name: Package DMG
         run: |
           mkdir build/dmg

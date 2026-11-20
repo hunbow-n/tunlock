@@ -30,11 +30,18 @@ enum Snapshot {
         StatusModel.shared.refresh()
         RunLoop.main.run(until: Date().addingTimeInterval(1.1))
         StatusModel.shared.refresh()
-        snapshot(MenuView().background(Color(nsColor: .windowBackgroundColor)), out + "-menu.png")
+        snapshot(MenuView().background(Color(nsColor: .windowBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: Shape.panelRadius, style: .continuous)), out + "-menu.png")
         if ProcessInfo.processInfo.environment["SNAPSHOT_MENU_ONLY"] != nil { return }
         snapshot(SettingsView(), out + "-settings.png")
         snapshot(SettingsView(tab: .exit), out + "-exit.png")
         snapshot(SettingsView(tab: .activity), out + "-activity.png")
+        snapshot(AgentView().background(Color(nsColor: .windowBackgroundColor)), out + "-agent.png")
+        if let draft = ProcessInfo.processInfo.environment["TUNLOCK_UI_DRAFT"] {
+            try? String(contentsOfFile: Paths.config, encoding: .utf8).write(toFile: draft, atomically: true, encoding: .utf8)
+            snapshot(SettingsView(), out + "-review.png")
+            try? FileManager.default.removeItem(atPath: draft)
+        }
         StatusModel.shared.testOutput = """
         Mode: protected, physical interface: en0, expected egress: 203.0.113.10
         PASS  pf enabled, tunlock rules loaded                 ok

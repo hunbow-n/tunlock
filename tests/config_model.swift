@@ -40,6 +40,17 @@ enum ConfigModelTests {
         let pr = p.render()
         check("proxy: no SSH keys written", !pr.contains("SSH_") && pr.contains("UPSTREAM=proxy"))
         check("proxy: exit defaults to the proxy IP", p.exitMatches(ip: "198.51.100.20", country: ""))
+        var r = TunConfig()
+        r.upstream = "proxy"; r.proxyHost = "198.51.100.20"; r.tunAddr = "10.20.0.1"
+        r.expectedEgress = " 162.210.67.182\n"  // pasted with a space and a newline (seen in the wild)
+        check("a pasted exit IP with whitespace still matches", r.exitMatches(ip: "162.210.67.182", country: "US"))
+        check("and is saved clean", r.render().contains("EXPECTED_EGRESS=162.210.67.182\n"))
+        check("garbage in the field is not taken for an IPv4", !looksLikeIPv4("162.210.67.182\n162.210.67.182"))
+
+        var x = TunConfig.parse("VPS_IP=203.0.113.10\nSSH_HOST=198.51.100.9\nPROBE_URL=https://1.0.0.1/cdn-cgi/trace\nTUN_ADDR=10.20.0.1\n")
+        x.sshUser = "me"
+        let xr = x.render()
+        check("keys the form has no field for are kept on save", xr.contains("SSH_HOST=\"198.51.100.9\"") && xr.contains("PROBE_URL=\"https://1.0.0.1/cdn-cgi/trace\""))
         exit(failures == 0 ? 0 : 1)
     }
 }

@@ -90,8 +90,13 @@ final class StatusModel: ObservableObject {
     private var pendingVerdict: Verdict?
     private var pendingSince = Date()
 
+    /// The pending agent draft (its text doubles as its version), if any.
+    @Published private(set) var draftID: String?
+    private var initialized = false
+
     private init() {
         refresh()
+        initialized = true
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             Task { @MainActor in StatusModel.shared.refresh() }
         }
@@ -122,6 +127,7 @@ final class StatusModel: ObservableObject {
         }
         checkDirectIP()
         trackVerdict()
+        watchDraft()
     }
 
     private func checkDirectIP() {
@@ -186,6 +192,14 @@ final class StatusModel: ObservableObject {
         }
     }
 
+    /// Turns protection on and reports the CLI result (used by the draft review).
+    func turnOn() async -> RunResult {
+        let r = await runCLIAsRoot("on")
+        directCheckedAt = .distantPast
+        refresh()
+        return r
+    }
+
     func runLeakTest() {
         busy = L("Testing for leaks…", "Проверяю утечки…")
         Task {
@@ -210,6 +224,17 @@ final class StatusModel: ObservableObject {
         refresh()
         if r.cancelled { return L("Cancelled.", "Отменено.") }
         return r.ok ? nil : r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// An agent proposed a config. The settings window opens (or comes to the
+    /// front) and offers it; an open form is never rebuilt under the user's edits.
+    /// Never during init: the window reads StatusModel.shared, which would recurse.
+    private func watchDraft() {
+        let content = try? String(contentsOfFile: Paths.draft, encoding: .utf8)
+        guard content != draftID else { return }
+        draftID = content
+        guard initialized, content != nil else { return }
+        DispatchQueue.main.async { Windows.shared.showSettings() }
     }
 
     private func trackVerdict() {
