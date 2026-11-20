@@ -367,6 +367,38 @@ expect_eq "guard: learns the TUN subnet from the interface when no mask is set" 
   "$(grep -c '10.20.0.0/30 to 10.20.0.0/30' "$STUB/anchor")" "2"
 rm -rf "$STUB"
 
+# ---- UPSTREAM=proxy: no server, no SSH; the TUN client talks to a proxy directly
+pxc=$(mktemp); printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\n' > "$pxc"
+pr=$(TUNLOCK_CONF=$pxc $T render-rules open utun7 en0)
+expect_eq "proxy: only the proxy is reachable outside the tunnel (tcp+udp)" \
+  "$(grep -c 'to 198.51.100.20 port 8080' <<< "$pr") $(grep -c 'port 22' <<< "$pr")" "2 0"
+expect_eq "proxy: the expected exit defaults to the proxy's IP" \
+  "$(TUNLOCK_CONF=$pxc $T config | grep -E '^(EXPECTED_EGRESS|ENTRY_HOST)=' | tr '\n' ' ')" "EXPECTED_EGRESS=198.51.100.20 ENTRY_HOST=198.51.100.20 "
+expect_eq "proxy: no SSH is run" "$(TUNLOCK_CONF=$pxc $T ssh-command)" "none: UPSTREAM=proxy runs no SSH"
+for bad in 'PROXY_HOST=proxy.example.com' 'PROXY_PORT=99999' 'UPSTREAM=vpn'; do
+  tmpx=$(mktemp); grep -v "^${bad%%=*}=" "$pxc" > "$tmpx"; echo "$bad" >> "$tmpx"
+  if out=$(TUNLOCK_CONF=$tmpx $T config 2>&1); then ko "proxy: rejects $bad" "$out"; else ok "proxy: rejects $bad"; fi
+  rm -f "$tmpx"
+done
+guard_setup; cp "$pxc" "$STUB/conf"; echo PROBE_INTERVAL=5 >> "$STUB/conf"; echo 198.51.100.20 > "$STUB/egress"; rm -f "$STUB/ssh_up"; gt 2
+expect_eq "proxy: guard opens once the exit is the proxy's IP, without any SSH" \
+  "$(st phase) $(st egress_ok) $(st ssh) $(st upstream) $(verdict)" "open 1 none proxy protected"
+rm -rf "$STUB"
+guard_setup; cp "$pxc" "$STUB/conf"; echo PROBE_INTERVAL=5 >> "$STUB/conf"; echo 198.51.100.20 > "$STUB/egress"
+printf '#!/bin/bash\n[[ $1 == 0 ]] && { rm -f "$STUB/egress"; sleep 6; }\nexit 0\n' > "$hook"; chmod +x "$hook"; gt 2 "$hook"
+expect_eq "proxy: proxy stops answering -> tunnel closed" "$(st phase) $(st egress_ok) $(verdict)" "probe 0 blocked"
+rm -rf "$STUB"
+guard_setup; cp "$pxc" "$STUB/conf"; echo 203.0.113.99 > "$STUB/egress"; gt 2
+expect_eq "proxy: a different exit IP never opens" "$(st phase) $(st egress_ok) $(verdict)" "probe 0 blocked"
+rm -rf "$STUB" "$pxc"
+
+# The exact file Tunlock.app writes in proxy mode must load
+appx=$(mktemp); printf '%s\n' "# Written by Tunlock.app. See tunlock.conf.example for all options." \
+  "# The proxy's login and password live only in the TUN app." "UPSTREAM=proxy" "PROXY_HOST=198.51.100.20" \
+  "PROXY_PORT=8080" "TUN_ADDR=10.20.0.1" "TUN_MASK=0xfffffffc" "PROBE_INTERVAL=30" 'TUN_SERVICE=""' > "$appx"
+if out=$(TUNLOCK_CONF=$appx $T render-rules block "" en0 2>&1); then ok "proxy: the app's config format loads"; else ko "proxy: the app's config format loads" "$out"; fi
+rm -f "$appx"
+
 bad_conf "a host name for VPS_IP" "VPS_IP=vps.example.com"
 bad_conf "an octet over 255" "VPS_IP=203.0.113.300"
 bad_conf "unknown keys" "SSH_OPTS=-o ProxyCommand=evil"

@@ -107,7 +107,7 @@ struct MenuView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(on ? L("Tunlock is on", "Tunlock включён") : L("Tunlock is off", "Tunlock выключен"))
                     .font(.headline)
-                Text(on ? L("Internet only through your server", "Интернет только через ваш сервер")
+                Text(on ? L("Internet only through the verified exit", "Интернет только через проверенный выход")
                         : L("Nothing blocked, tunnel stopped", "Ничего не блокирует, туннель остановлен"))
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -136,7 +136,13 @@ struct MenuView: View {
                 Hop(status: .neutral, title: L("Internet, directly", "Интернет напрямую"),
                     detail: L("no tunnel, no kill switch", "без туннеля и без защиты"), last: true)
             } else {
-                if s["cascade"] == "1" {
+                if s["upstream"] == "proxy" {
+                    let up = s["entry_up"]
+                    Hop(status: up == "up" ? .good : up == "down" ? .bad : .neutral,
+                        title: L("Proxy", "Прокси") + (entryName.isEmpty ? "" : " · \(entryName)"),
+                        detail: (s["entry"] ?? "") + " · " + (up == "up" ? L("reachable", "доступен")
+                            : up == "down" ? L("not reachable", "недоступен") : L("checking", "проверяю")))
+                } else if s["cascade"] == "1" {
                     let up = s["entry_up"]
                     Hop(status: up == "up" ? .good : up == "down" ? .bad : .neutral,
                         title: L("Entry", "Вход") + (entryName.isEmpty ? "" : " · \(entryName)"),
@@ -156,7 +162,7 @@ struct MenuView: View {
 
     private func exitStatus(_ s: [String: String]) -> Hop.Status {
         if s["egress_ok"] == "1" { return .good }
-        if s["ssh"] != "up" { return .bad }
+        if s["upstream"] != "proxy", s["ssh"] != "up" { return .bad }
         return .warn
     }
 
@@ -164,7 +170,7 @@ struct MenuView: View {
         let expected = s["expected"] ?? ""
         var parts = [expected]
         if let c = s["egress_country"], !c.isEmpty { parts.append("\(flagEmoji(c)) \(countryName(c))") }
-        if s["ssh"] != "up" {
+        if s["upstream"] != "proxy", s["ssh"] != "up" {
             parts.append(L("SSH down", "SSH не подключён"))
         } else if s["egress_ok"] == "1" {
             let age = Int(Date().timeIntervalSince1970 - (TimeInterval(s["egress_at"] ?? "") ?? 0))

@@ -85,9 +85,14 @@ no answer, SSH goes down, or the Mac wakes from sleep.
 
 ## Quick start
 
-**You need:** a server you can SSH into by IPv4 (with its host key in
-`~/.ssh/known_hosts`), and a TUN app whose proxy points at the local SSH
-forward. Tunlock manages SSH and the firewall around the TUN app you already
+**You need** a TUN app (Karing, sing-box…) and one of these:
+
+- **your own server** you can SSH into by IPv4 (host key in `~/.ssh/known_hosts`):
+  Tunlock keeps the SSH tunnel up and the TUN app sends traffic into it;
+- **or just a proxy** (IP, port, login, password) that already works in your TUN
+  app: no server and no SSH needed, see [No server? Use your proxy](#no-server-use-your-proxy).
+
+Tunlock manages the firewall (and SSH, if used) around the TUN app you already
 use; it does not include one.
 
 ```bash
@@ -108,6 +113,29 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
 The build is ad-hoc signed and not notarized. A copy you build yourself opens
 normally. A downloaded copy needs right-click → **Open** the first time.
 
+## No server? Use your proxy
+
+<img src="docs/screenshots/en-proxy-menu.png" width="300" align="right" alt="Tunlock in proxy mode">
+
+If all you have is a proxy like `IP:PORT:USER:PASSWORD` and you use it in
+Karing, that is enough. Tunlock does not need the login or password and never
+sees them: they stay in Karing.
+
+1. In Karing, add the proxy (HTTP or SOCKS5, with its login and password) and
+   turn on **global mode**. Check that sites open.
+2. In Tunlock's settings choose **Straight to a proxy (no server)**.
+3. Enter only the proxy's **IP** and **port**, press **Check proxy**.
+4. Pick Karing's TUN interface, press **Check exit IP**. If the proxy exits from
+   a different address than its own IP, press **Use … as the expected exit IP**.
+5. **Save and apply**, then flip the switch.
+
+From then on, the Mac may only talk to that proxy. If the proxy blinks, goes
+down, or Karing quits, the internet stops until traffic exits with the proxy's
+IP again. A **rotating** proxy (a new exit IP every few minutes) does not fit:
+Tunlock treats each new IP as a foreign exit and keeps the internet closed.
+
+<br clear="right">
+
 ## Configuration
 
 The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
@@ -115,7 +143,9 @@ The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
 
 | key | meaning |
 |---|---|
-| `VPS_IP` | your server: SSH target and, by default, the only accepted exit IP |
+| `UPSTREAM` | `ssh` (default, your server) or `proxy` (no server: the TUN app talks to a proxy) |
+| `PROXY_HOST`, `PROXY_PORT` | proxy mode: the proxy's IPv4 and port, the only host reachable outside the tunnel |
+| `VPS_IP` | ssh mode: your server, the SSH target and, by default, the only accepted exit IP |
 | `SSH_USER`, `SSH_PORT`, `SSH_IDENTITY` | how to log in |
 | `SSH_FORWARD` | what SSH forwards: `-L …` to a proxy on the server, or `-D` for SOCKS |
 | `JUMP_HOST`, `JUMP_USER`, `JUMP_PORT` | optional relay: SSH enters here and reaches `VPS_IP` from there |

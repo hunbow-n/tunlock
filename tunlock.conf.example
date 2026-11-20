@@ -1,6 +1,15 @@
 # tunlock configuration. Copy to /usr/local/etc/tunlock.conf and edit.
 # Example values use documentation addresses (RFC 5737): replace them.
 
+# How the TUN app reaches the outside:
+#   UPSTREAM=ssh    (default) through an SSH forward to your own server, below
+#   UPSTREAM=proxy  no server: the TUN app connects straight to a proxy. Then
+#                   set only PROXY_HOST/PROXY_PORT (plus TUN_ADDR/TUN_MASK);
+#                   the proxy's login and password stay in the TUN app.
+#UPSTREAM=proxy
+#PROXY_HOST=198.51.100.20
+#PROXY_PORT=8080
+
 # Your server. It is the SSH endpoint and, by default, the expected egress IP.
 VPS_IP=203.0.113.10
 SSH_USER=me

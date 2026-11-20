@@ -23,8 +23,10 @@ enum Snapshot {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let out = CommandLine.arguments[1]
-        UserDefaults.standard.set(isRussian ? "Варшава" : "Warsaw", forKey: HopNames.entryKey)
-        UserDefaults.standard.set(isRussian ? "Амстердам" : "Amsterdam", forKey: HopNames.exitKey)
+        let proxy = ProcessInfo.processInfo.environment["SNAPSHOT_PROXY"] != nil
+        UserDefaults.standard.set(proxy ? "" : (isRussian ? "Варшава" : "Warsaw"), forKey: HopNames.entryKey)
+        UserDefaults.standard.set(proxy ? (isRussian ? "Нью-Йорк" : "New York") : (isRussian ? "Амстердам" : "Amsterdam"),
+                                  forKey: HopNames.exitKey)
         StatusModel.shared.refresh()
         RunLoop.main.run(until: Date().addingTimeInterval(1.1))
         StatusModel.shared.refresh()

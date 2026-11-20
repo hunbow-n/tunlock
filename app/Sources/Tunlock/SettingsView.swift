@@ -10,6 +10,8 @@ struct SettingsView: View {
     @State private var tuns: [TunInterface] = tunInterfaces()
     @State private var sshCheck: Check = .idle
     @State private var ipCheck: Check = .idle
+    @State private var seenIP: String?
+    @State private var proxyCheck: Check = .idle
     @State private var saving = false
     @State private var saveError: String?
     @State private var saved = false
@@ -27,7 +29,8 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             Form {
                 if !model.installed { welcome }
-                serverSection
+                upstreamSection
+                if config.isProxy { proxySection } else { serverSection }
                 tunnelSection
                 checkSection
                 exceptionsSection
@@ -94,19 +97,56 @@ struct SettingsView: View {
         }
     }
 
+    private var upstreamSection: some View {
+        Section {
+            Picker(L("How your TUN app goes out", "Как TUN-приложение выходит в интернет"), selection: $config.upstream) {
+                Text(L("Through my server over SSH", "Через мой сервер по SSH")).tag("ssh")
+                Text(L("Straight to a proxy (no server)", "Напрямую через прокси (без сервера)")).tag("proxy")
+            }
+            .pickerStyle(.radioGroup)
+        } header: {
+            Text(L("Connection", "Подключение"))
+        } footer: {
+            FooterText(config.isProxy
+                ? L("You have a proxy (IP, port, login, password) set up in your TUN app, e.g. Karing. Tunlock lets the Mac reach only that proxy and opens the internet only when traffic exits with the proxy's IP.",
+                    "У вас есть прокси (IP, порт, логин, пароль), настроенный в TUN-приложении, например в Karing. Tunlock разрешит Mac связываться только с этим прокси и откроет интернет, только когда трафик выходит с IP прокси.")
+                : L("You have your own server (VPS) you can SSH into. Tunlock keeps the SSH tunnel up; your TUN app sends traffic into it.",
+                    "У вас есть свой сервер (VPS) с доступом по SSH. Tunlock держит SSH-туннель, а TUN-приложение отправляет в него трафик."))
+        }
+    }
+
+    private var proxySection: some View {
+        Section {
+            TextField(L("Proxy IP", "IP прокси"), text: $config.proxyHost, prompt: Text("198.51.100.20"))
+            TextField(L("Proxy port", "Порт прокси"), text: $config.proxyPort, prompt: Text("8080"))
+            HStack {
+                Button(L("Check proxy", "Проверить прокси"), action: checkProxy)
+                    .disabled(config.proxyHost.isEmpty || config.proxyPort.isEmpty || proxyCheck == .running)
+                checkLabel(proxyCheck)
+            }
+        } header: {
+            Text(L("Proxy", "Прокси"))
+        } footer: {
+            FooterText(L("Only the IP and port. The login and password stay in your TUN app: Tunlock never needs or sees them. Use the IP address, not a name: DNS is blocked while protected.",
+                         "Только IP и порт. Логин и пароль остаются в TUN-приложении: Tunlock они не нужны, и он их не видит. Указывайте IP, а не имя: в защищённом режиме DNS заблокирован."))
+        }
+    }
+
     private var tunnelSection: some View {
         Section {
-            Picker(L("Through SSH", "Через SSH"), selection: $config.forward) {
-                ForEach(ForwardKind.allCases) { Text($0.title).tag($0) }
-            }
-            switch config.forward {
-            case .shadowsocks:
-                TextField(L("Local port", "Локальный порт"), text: $config.localPort)
-                TextField(L("Proxy port on the server", "Порт прокси на сервере"), text: $config.remotePort, prompt: Text("8388"))
-            case .socks:
-                TextField(L("Local SOCKS port", "Локальный SOCKS-порт"), text: $config.localPort)
-            case .custom:
-                TextField("SSH_FORWARD", text: $config.customForward, prompt: Text("-L 127.0.0.1:1080:127.0.0.1:8388"))
+            if !config.isProxy {
+                Picker(L("Through SSH", "Через SSH"), selection: $config.forward) {
+                    ForEach(ForwardKind.allCases) { Text($0.title).tag($0) }
+                }
+                switch config.forward {
+                case .shadowsocks:
+                    TextField(L("Local port", "Локальный порт"), text: $config.localPort)
+                    TextField(L("Proxy port on the server", "Порт прокси на сервере"), text: $config.remotePort, prompt: Text("8388"))
+                case .socks:
+                    TextField(L("Local SOCKS port", "Локальный SOCKS-порт"), text: $config.localPort)
+                case .custom:
+                    TextField("SSH_FORWARD", text: $config.customForward, prompt: Text("-L 127.0.0.1:1080:127.0.0.1:8388"))
+                }
             }
             Picker(L("TUN app to start and stop", "TUN-приложение (вкл/выкл вместе с Tunlock)"), selection: $config.tunService) {
                 Text(L("Don't control", "Не управлять")).tag("")
@@ -131,7 +171,10 @@ struct SettingsView: View {
         } header: {
             Text(L("Tunnel", "Туннель"))
         } footer: {
-            FooterText(config.forward == .custom
+            FooterText(config.isProxy
+                 ? L("Turn your TUN app on with the proxy profile, then pick its interface here. The number (utunN) may change later; the address may not.",
+                     "Включите TUN-приложение с профилем прокси и выберите здесь его интерфейс. Номер utunN потом может меняться, адрес — нет.")
+                 : config.forward == .custom
                  ? L("Only -L and -D are accepted.", "Допускаются только -L и -D.")
                  : L("In your TUN app, point the proxy at 127.0.0.1:\(config.localPort). Turn the TUN app on, then pick its interface here. The number (utunN) may change later; the address may not.",
                      "В TUN-приложении укажите прокси 127.0.0.1:\(config.localPort). Включите его и выберите здесь интерфейс. Номер utunN потом может меняться, адрес — нет."))
@@ -141,11 +184,20 @@ struct SettingsView: View {
     private var checkSection: some View {
         Section {
             TextField(L("Expected exit IP", "Ожидаемый выходной IP"), text: $config.expectedEgress,
-                      prompt: Text(config.vpsIP.isEmpty ? L("same as server", "как у сервера") : config.vpsIP))
+                      prompt: Text(config.effectiveEgress.isEmpty
+                                   ? (config.isProxy ? L("same as the proxy", "как у прокси") : L("same as server", "как у сервера"))
+                                   : config.effectiveEgress))
             HStack {
                 Button(L("Check exit IP now", "Проверить IP сейчас"), action: checkIP)
                     .disabled(config.tunAddr.isEmpty || ipCheck == .running)
                 checkLabel(ipCheck)
+            }
+            if let ip = seenIP, ip != config.effectiveEgress {
+                Button(L("Use \(ip) as the expected exit IP", "Использовать \(ip) как ожидаемый выходной IP")) {
+                    config.expectedEgress = ip
+                    ipCheck = .ok(L("\(ip): will be expected", "\(ip): будет ожидаться"))
+                }
+                .buttonStyle(.link)
             }
         } header: {
             Text(L("Exit check", "Проверка выхода"))
@@ -251,7 +303,8 @@ struct SettingsView: View {
             if saving { ProgressView().controlSize(.small) }
             Button(L("Save and apply", "Сохранить и применить"), action: save)
                 .keyboardShortcut(.defaultAction)
-                .disabled(saving || config.vpsIP.isEmpty || config.tunAddr.isEmpty)
+                .disabled(saving || config.tunAddr.isEmpty
+                          || (config.isProxy ? config.proxyHost.isEmpty || config.proxyPort.isEmpty : config.vpsIP.isEmpty))
         }
     }
 
@@ -323,6 +376,7 @@ struct SettingsView: View {
             let r = await run("/usr/bin/curl", ["-4fsS", "--noproxy", "*", "--interface", c.tunAddr,
                                                 "--connect-timeout", "4", "--max-time", "6", "https://1.1.1.1/cdn-cgi/trace"])
             let ip = r.output.split(separator: "\n").first { $0.hasPrefix("ip=") }.map { String($0.dropFirst(3)) }
+            seenIP = ip
             if let ip, ip == c.effectiveEgress {
                 ipCheck = .ok(L("\(ip): matches", "\(ip): совпадает"))
             } else if let ip {
@@ -330,6 +384,16 @@ struct SettingsView: View {
             } else {
                 ipCheck = .failed(L("No answer through the tunnel", "Нет ответа через туннель"))
             }
+        }
+    }
+
+    private func checkProxy() {
+        proxyCheck = .running
+        let c = config
+        Task {
+            let r = await run("/usr/bin/nc", ["-z", "-G", "4", c.proxyHost, c.proxyPort])
+            proxyCheck = r.ok ? .ok(L("Proxy answers", "Прокси отвечает"))
+                              : .failed(L("No answer from \(c.proxyHost):\(c.proxyPort)", "Нет ответа от \(c.proxyHost):\(c.proxyPort)"))
         }
     }
 

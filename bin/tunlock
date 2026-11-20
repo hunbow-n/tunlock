@@ -31,7 +31,7 @@ is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # ---------------------------------------------------------------- config
 
-CONFIG_KEYS='VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS PROBE_URL PROBE_INTERVAL PF_ANCHOR'
+CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS PROBE_URL PROBE_INTERVAL PF_ANCHOR'
 
 # Parse KEY=value lines without sourcing: the guard runs as root.
 load_config() {
@@ -51,14 +51,33 @@ load_config() {
     printf -v "$key" '%s' "$val"
   done < "$CONF"
 
-  : "${SSH_HOST:=$VPS_IP}" "${EXPECTED_EGRESS:=$VPS_IP}" "${SSH_PORT:=22}"
-  : "${PROBE_URL:=https://1.1.1.1/cdn-cgi/trace}" "${PROBE_INTERVAL:=30}"
-  : "${PF_ANCHOR:=com.apple/000.tunlock}" "${JUMP_USER:=$SSH_USER}" "${JUMP_PORT:=22}"
+  : "${UPSTREAM:=ssh}" "${PROBE_URL:=https://1.1.1.1/cdn-cgi/trace}" "${PROBE_INTERVAL:=30}"
+  : "${PF_ANCHOR:=com.apple/000.tunlock}"
+  is_ipv4 "$TUN_ADDR" || die "TUN_ADDR must be the IPv4 address of your TUN interface"
 
+  # Two ways the TUN client reaches the outside:
+  #   ssh    through an SSH forward that tunlock keeps up (own server, optional relay)
+  #   proxy  the TUN client connects straight to a proxy (HTTP/SOCKS/...);
+  #          tunlock runs no SSH and never sees the proxy's credentials
+  case $UPSTREAM in
+    proxy)
+      is_ipv4 "$PROXY_HOST" || die "PROXY_HOST must be the proxy's IPv4 address: DNS is blocked while protected"
+      is_port "$PROXY_PORT" || die "PROXY_PORT is not a port"
+      : "${EXPECTED_EGRESS:=$PROXY_HOST}"
+      is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address"
+      ENTRY_HOST=$PROXY_HOST ENTRY_PORT=$PROXY_PORT
+      FORWARD_ARGS=() HEALTH_HOST='' HEALTH_PORT=''
+      parse_common
+      return
+      ;;
+    ssh) ;;
+    *) die "UPSTREAM must be ssh or proxy" ;;
+  esac
+  : "${SSH_HOST:=$VPS_IP}" "${EXPECTED_EGRESS:=$VPS_IP}" "${SSH_PORT:=22}"
+  : "${JUMP_USER:=$SSH_USER}" "${JUMP_PORT:=22}"
   is_ipv4 "$VPS_IP" || die "VPS_IP must be an IPv4 address"
   is_ipv4 "$SSH_HOST" || die "SSH_HOST must be an IPv4 address: DNS is blocked while protected"
   is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address"
-  is_ipv4 "$TUN_ADDR" || die "TUN_ADDR must be the IPv4 address of your TUN interface"
   is_port "$SSH_PORT" || die "SSH_PORT is not a port"
   # Cascade: SSH enters through JUMP_HOST and reaches SSH_HOST from there.
   # Only the entry is reachable outside the tunnel; egress stays EXPECTED_EGRESS.
@@ -70,21 +89,26 @@ load_config() {
   else
     ENTRY_HOST=$SSH_HOST ENTRY_PORT=$SSH_PORT
   fi
+  # Goes into a ProxyCommand line, so keep it to plain path characters.
+  [[ -z $SSH_IDENTITY || $SSH_IDENTITY =~ ^[~A-Za-z0-9._/-]+$ ]] || die "SSH_IDENTITY: use a path without spaces"
+  [[ $SSH_USER =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "SSH_USER is missing or invalid"
+  parse_forward
+  parse_common
+}
+
+# Settings shared by both upstreams.
+parse_common() {
   parse_bypass
   # Name of the TUN client's VPN service in "scutil --nc list" (e.g. Karing):
   # optional; when set, on/off also start and stop it.
   [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
-  TUN_NET=$(tun_net "$TUN_MASK")
-  # Goes into a ProxyCommand line, so keep it to plain path characters.
-  [[ -z $SSH_IDENTITY || $SSH_IDENTITY =~ ^[~A-Za-z0-9._/-]+$ ]] || die "SSH_IDENTITY: use a path without spaces"
   [[ -z $TUN_MASK || $TUN_MASK =~ ^0x[0-9a-f]{8}$ ]] || die "TUN_MASK must look like 0xfffffffc"
-  [[ $SSH_USER =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "SSH_USER is missing or invalid"
+  TUN_NET=$(tun_net "$TUN_MASK")
   [[ $PROBE_INTERVAL =~ ^[0-9]+$ ]] && (( PROBE_INTERVAL >= 5 )) || die "PROBE_INTERVAL must be >= 5"
   [[ $PF_ANCHOR =~ ^[A-Za-z0-9._/-]+$ ]] || die "PF_ANCHOR is invalid"
   PROBE_IP=''
   [[ $PROBE_URL =~ ^https://([0-9.]+)(/[A-Za-z0-9._/~-]*)?$ ]] && PROBE_IP=${BASH_REMATCH[1]}
   is_ipv4 "$PROBE_IP" || die "PROBE_URL must be https:// with an IPv4 literal host"
-  parse_forward
 }
 
 is_cidr() {
@@ -228,6 +252,8 @@ render_body() {
   local phase=$1 ifc=$2 phys=$3 item
   echo "pass quick on lo0 all no state"
   echo "pass out quick inet proto tcp to $ENTRY_HOST port $ENTRY_PORT flags any keep state (if-bound)"
+  # A proxy may also carry UDP (SOCKS5 UDP associate, QUIC-capable protocols).
+  [[ $UPSTREAM != proxy ]] || echo "pass out quick inet proto udp to $ENTRY_HOST port $ENTRY_PORT keep state (if-bound)"
   echo "pass out quick inet proto udp from any port 68 to any port 67 no state"
   echo "pass in quick inet proto udp from any port 67 to any port 68 no state"
   # Exceptions leave only through the physical interface, never another tunnel.
@@ -532,6 +558,7 @@ write_state() {
     echo "entry=$ENTRY_HOST:$ENTRY_PORT"
     echo "entry_up=$G_ENTRY"
     echo "cascade=$([[ -n $JUMP_HOST ]] && echo 1 || echo 0)"
+    echo "upstream=$UPSTREAM"
     echo "egress_ip=$G_EGRESS_IP"
     echo "egress_ok=$G_EGRESS_OK"
     echo "egress_at=$G_EGRESS_AT"
@@ -656,7 +683,10 @@ guard_tick() {
   # Exceptions hold in both modes, so the LAN works the same either way.
   sync_bypass_routes
   sync_resolvers
-  if ssh_up; then G_SSH=up; else G_SSH=down; fi
+  if [[ $UPSTREAM == proxy ]]; then G_SSH=none
+  elif ssh_up; then G_SSH=up
+  else G_SSH=down
+  fi
   if (( now - G_ENTRY_AT >= 15 )); then
     G_ENTRY_AT=$now
     if entry_up; then G_ENTRY=up; else G_ENTRY=down; fi
@@ -792,6 +822,12 @@ cmd_ssh_run() {
   [[ $EUID != 0 ]] || die "ssh-run must run as your user, so ssh uses your key"
   load_config
   local iface
+  # Proxy upstream: the TUN client reaches the proxy itself, no SSH at all.
+  # Stay idle (not exit) so launchd does not respawn this job in a loop.
+  if [[ $UPSTREAM == proxy ]]; then
+    log "UPSTREAM=proxy: no SSH forward needed"
+    while :; do sleep 3600; done
+  fi
   # While tunlock is off, hold no port: other tools may use it. "off"
   # restarts this job, so a running ssh stops and lands here.
   if [[ $(read_mode) != protected ]]; then
@@ -989,10 +1025,14 @@ cmd_status() {
   local e_line="none"
   [[ -n $eip ]] && e_line="$eip ($( [[ $eok == 1 ]] && echo verified || echo NOT expected ), $(age $((now - eat))) ago)"
   printf '%-8s %s\n' Mode "$mode"
-  if [[ $(state_get cascade) == 1 ]]; then
-    printf '%-8s %s\n' Entry "$(state_get entry_up)  $(state_get entry) (cascade)"
+  if [[ $(state_get upstream) == proxy ]]; then
+    printf '%-8s %s\n' Proxy "$(state_get entry_up)  $(state_get entry)"
+  else
+    if [[ $(state_get cascade) == 1 ]]; then
+      printf '%-8s %s\n' Entry "$(state_get entry_up)  $(state_get entry) (cascade)"
+    fi
+    printf '%-8s %s\n' SSH "$ssh  $(state_get ssh_endpoint)"
   fi
-  printf '%-8s %s\n' SSH "$ssh  $(state_get ssh_endpoint)"
   printf '%-8s %s\n' Egress "$e_line  expected $(state_get expected)${tun:+  via $tun}"
   printf '%-8s %s\n' PF "phase $phase, pf $( [[ $pfe == 1 ]] && echo enabled || echo disabled ), $pfr rules in $(state_get pf_anchor)"
   [[ -z $(state_get bypass) ]] || printf '%-8s %s\n' Direct "$(state_get bypass) (around the tunnel)"
@@ -1096,12 +1136,23 @@ cmd_doctor() {
   fi
   load_config
   guard_running && item ok "guard running ($GUARD_LABEL)" || item bad "guard not loaded ($GUARD_LABEL)"
+  local tun
+  if [[ $UPSTREAM == proxy ]]; then
+    tun=$(find_tun || true)
+    [[ -n $tun ]] && item ok "TUN $TUN_ADDR on $tun" || item bad "no utun with $TUN_ADDR (TUN client off?)"
+    entry_up && item ok "proxy $ENTRY_HOST:$ENTRY_PORT reachable outside the tunnel" \
+      || item bad "proxy $ENTRY_HOST:$ENTRY_PORT not reachable outside the tunnel"
+    if [[ $EUID == 0 ]]; then
+      pf_anchor_reachable && item ok "root pf ruleset reaches $PF_ANCHOR" || item bad "root pf ruleset does not reach $PF_ANCHOR"
+    else echo "--   run with sudo to check pf"; fi
+    (( ok ))
+    return
+  fi
   local u=${SUDO_UID:-$EUID}
   if launchctl print "gui/$u/$SSH_LABEL" >/dev/null 2>&1; then item ok "ssh agent loaded ($SSH_LABEL)"
   else item bad "ssh agent not loaded for uid $u ($SSH_LABEL)"; fi
   ssh_up && item ok "forward listening on $HEALTH_HOST:$HEALTH_PORT" \
     || item bad "nothing listens on $HEALTH_HOST:$HEALTH_PORT"
-  local tun
   tun=$(find_tun || true)
   [[ -n $tun ]] && item ok "TUN $TUN_ADDR on $tun" || item bad "no utun with $TUN_ADDR (TUN client off?)"
   local kh="$HOME/.ssh/known_hosts"
@@ -1171,7 +1222,10 @@ main() {
       done ;;
     _sync-resolvers) test_only; load_config; G_WARNING=''; sync_resolvers; echo "warning=$G_WARNING" ;;  # tests
     ssh-run) cmd_ssh_run ;;
-    ssh-command) load_config; build_ssh_args "$(physical_iface)"; printf '%q ' "${SSH_ARGS[@]}"; echo ;;
+    ssh-command)
+      load_config
+      [[ $UPSTREAM != proxy ]] || { echo "none: UPSTREAM=proxy runs no SSH"; exit 0; }
+      build_ssh_args "$(physical_iface)"; printf '%q ' "${SSH_ARGS[@]}"; echo ;;
     render-rules) load_config; render_rules "${1:-block}" "${2:-}" "${3-$(physical_iface)}" ;;
     config) load_config; cmd_config ;;
     version | --version) echo "tunlock $VERSION" ;;

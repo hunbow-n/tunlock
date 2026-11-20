@@ -95,6 +95,12 @@ struct DNSRule: Equatable, Identifiable {
 /// The subset of tunlock.conf the app edits. Unknown lines are not kept:
 /// the file is fully owned by this form once saved from the app.
 struct TunConfig: Equatable {
+    /// "ssh": through an SSH forward to your server. "proxy": the TUN app
+    /// connects straight to a proxy; Tunlock runs no SSH and never sees the
+    /// proxy's login and password, which stay in the TUN app.
+    var upstream = "ssh"
+    var proxyHost = ""
+    var proxyPort = ""
     var vpsIP = ""
     var sshUser = NSUserName()
     var sshPort = "22"
@@ -123,9 +129,11 @@ struct TunConfig: Equatable {
         }
     }
 
-    var effectiveEgress: String { expectedEgress.isEmpty ? vpsIP : expectedEgress }
+    var isProxy: Bool { upstream == "proxy" }
+    var effectiveEgress: String { expectedEgress.isEmpty ? (isProxy ? proxyHost : vpsIP) : expectedEgress }
 
     func render() -> String {
+        if isProxy { return renderProxy() }
         var lines = [
             "# Written by Tunlock.app. See tunlock.conf.example for all options.",
             "VPS_IP=\(vpsIP)",
@@ -147,6 +155,25 @@ struct TunConfig: Equatable {
             lines.append("JUMP_PORT=\(jumpPort)")
         }
         if !expectedEgress.isEmpty, expectedEgress != vpsIP { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func renderProxy() -> String {
+        var lines = [
+            "# Written by Tunlock.app. See tunlock.conf.example for all options.",
+            "# The proxy's login and password live only in the TUN app.",
+            "UPSTREAM=proxy",
+            "PROXY_HOST=\(proxyHost)",
+            "PROXY_PORT=\(proxyPort)",
+            "TUN_ADDR=\(tunAddr)",
+            "TUN_MASK=\(tunMask)",
+            "PROBE_INTERVAL=\(probeInterval)",
+            "TUN_SERVICE=\"\(tunService)\"",
+        ]
+        if !bypassNets.isEmpty { lines.append("BYPASS_NETS=\"\(bypassNets.joined(separator: " "))\"") }
+        let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
+        if !dns.isEmpty { lines.append("BYPASS_DNS=\"\(dns.map { "\($0.domain)=\($0.server)" }.joined(separator: " "))\"") }
+        if !expectedEgress.isEmpty, expectedEgress != proxyHost { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -174,6 +201,9 @@ struct TunConfig: Equatable {
         c.jumpUser = values["JUMP_USER"] ?? ""
         c.jumpPort = values["JUMP_PORT"] ?? "22"
         c.tunService = values["TUN_SERVICE"] ?? ""
+        c.upstream = values["UPSTREAM"] == "proxy" ? "proxy" : "ssh"
+        c.proxyHost = values["PROXY_HOST"] ?? ""
+        c.proxyPort = values["PROXY_PORT"] ?? ""
         c.bypassNets = (values["BYPASS_NETS"] ?? "").split(separator: " ").map(String.init)
         c.bypassDNS = (values["BYPASS_DNS"] ?? "").split(separator: " ").compactMap { item in
             let p = item.split(separator: "=", maxSplits: 1).map(String.init)
