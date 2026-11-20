@@ -31,7 +31,10 @@ enum Snapshot {
         RunLoop.main.run(until: Date().addingTimeInterval(1.1))
         StatusModel.shared.refresh()
         snapshot(MenuView().background(Color(nsColor: .windowBackgroundColor)), out + "-menu.png")
+        if ProcessInfo.processInfo.environment["SNAPSHOT_MENU_ONLY"] != nil { return }
         snapshot(SettingsView(), out + "-settings.png")
+        snapshot(SettingsView(tab: .exit), out + "-exit.png")
+        snapshot(SettingsView(tab: .activity), out + "-activity.png")
         StatusModel.shared.testOutput = """
         Mode: protected, physical interface: en0, expected egress: 203.0.113.10
         PASS  pf enabled, tunlock rules loaded                 ok

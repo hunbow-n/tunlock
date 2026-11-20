@@ -46,6 +46,10 @@ TUN_MASK=
 # Egress check: HTTPS to an IPv4 literal that echoes your address (no DNS).
 # EXPECTED_EGRESS defaults to VPS_IP; set it if the server exits elsewhere.
 #EXPECTED_EGRESS=203.0.113.10
+# Pin by country too (two letters), or instead of the IP for rotating exits:
+#   EXPECTED_COUNTRY=US                       pinned IP and it must be in US
+#   EXPECTED_EGRESS=any + EXPECTED_COUNTRY=US  any IP, but only in US
+#EXPECTED_COUNTRY=US
 PROBE_URL=https://1.1.1.1/cdn-cgi/trace
 PROBE_INTERVAL=30
 

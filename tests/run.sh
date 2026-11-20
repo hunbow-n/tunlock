@@ -27,7 +27,7 @@ bad_conf() { # name, line to append or replace
 }
 
 if command -v shellcheck >/dev/null; then
-  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh 2>&1); then
+  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh 2>&1); then
     ok shellcheck; else ko shellcheck "$out"; fi
 else echo "skip shellcheck (not installed)"; fi
 
@@ -165,6 +165,7 @@ rm -rf "$STUB"
 
 guard_setup; touch "$STUB/states_fail"; gt 2
 expect_eq "guard: failed connection reset is an error" "$(verdict) | $(st error)" "unprotected | could not reset existing connections"
+expect_eq "guard: no open phase while old connections were not reset" "$(st phase) $(st egress_ok)" "probe 0"
 rm -rf "$STUB"
 
 guard_setup; echo "192.168.0.0/24 192.168.1.1" > "$STUB/run/routes"; echo "utun6 10.20.0.1" > "$STUB/kernel_route"; gt 1
@@ -249,6 +250,15 @@ rm -rf "$STUB"
 guard_setup; gt 1
 expect_eq "routes: a working route is left alone" "$([[ -e $STUB/route.log ]] && cat "$STUB/route.log")" ""
 rm -rf "$STUB" "$hook"
+
+guard_setup
+echo "192.168.0.0/24 192.168.1.1 en0 192.168.1.45" > "$STUB/run/routes"
+echo "192.168.1.208" > "$STUB/physical_ipv4"
+gt 2
+expect_eq "routes: same gateway with a new interface address is rebound once" \
+  "$(cat "$STUB/route.log")" $'delete 192.168.0.0/24 192.168.1.1\nadd 192.168.0.0/24 192.168.1.1 -ifp en0 -ifa 192.168.1.208'
+expect_eq "routes: records the new source address" "$(cat "$STUB/run/routes")" "192.168.0.0/24 192.168.1.1 en0 192.168.1.208"
+rm -rf "$STUB"
 
 # ---- protect/direct: success only when the guard answers this very request
 # fake_guard mode phase pf_enabled [error] [answer=1]: a background responder
@@ -399,6 +409,38 @@ appx=$(mktemp); printf '%s\n' "# Written by Tunlock.app. See tunlock.conf.exampl
 if out=$(TUNLOCK_CONF=$appx $T render-rules block "" en0 2>&1); then ok "proxy: the app's config format loads"; else ko "proxy: the app's config format loads" "$out"; fi
 rm -f "$appx"
 
+# ---- exit by country: pin an IP, a country, or both
+geo() { # extra config lines..., then runs 2 guard ticks
+  guard_setup; for l in "$@"; do echo "$l" >> "$STUB/conf"; done; gt 2
+}
+geo EXPECTED_COUNTRY=NL
+expect_eq "geo: pinned IP and the right country opens" "$(st phase) $(st egress_ok) $(st egress_country)" "open 1 NL"; rm -rf "$STUB"
+geo EXPECTED_COUNTRY=us
+expect_eq "geo: the right IP in the wrong country stays closed" "$(st phase) $(st egress_ok) $(verdict)" "probe 0 blocked"; rm -rf "$STUB"
+geo EXPECTED_EGRESS=any EXPECTED_COUNTRY=NL
+expect_eq "geo: any IP accepted within the country (rotating exits)" "$(st phase) $(st egress_ok)" "open 1"; rm -rf "$STUB"
+guard_setup; printf 'EXPECTED_EGRESS=any\nEXPECTED_COUNTRY=NL\n' >> "$STUB/conf"; echo 192.0.2.77 > "$STUB/egress"; gt 2
+expect_eq "geo: a new IP in the same country keeps it open" "$(st phase) $(st egress_ip)" "open 192.0.2.77"; rm -rf "$STUB"
+bad_conf "EXPECTED_EGRESS=any without a country" "EXPECTED_EGRESS=any"
+bad_conf "a bad country code" "EXPECTED_COUNTRY=USA"
+
+GITHUB_ACTIONS='' TUNLOCK_PF_LIVE=1 bash tests/pf-live.sh >/dev/null 2>&1; rc=$?
+expect_eq "pf-live refuses to run outside CI (it would cut the network)" "$rc" "2"
+
+# Restarted guard: reset old connections again only if the outside policy changed
+guard_setup; gt 1; gt 1
+expect_eq "restart with the same policy keeps connections" "$(wc -l < "$STUB/states.log" | tr -d ' ')" "1"
+echo 'BYPASS_NETS="10.9.0.0/16"' >> "$STUB/conf"; gt 1
+expect_eq "restart after an exception changed resets old connections" "$(wc -l < "$STUB/states.log" | tr -d ' ')" "2"
+sed -i '' 's/^VPS_IP=.*/VPS_IP=203.0.113.11/' "$STUB/conf"; echo 'EXPECTED_EGRESS=203.0.113.10' >> "$STUB/conf"; gt 1
+expect_eq "restart after the server/proxy changed resets old connections" "$(wc -l < "$STUB/states.log" | tr -d ' ')" "3"
+rm -rf "$STUB"
+# Same host and port, proxy -> ssh: proxy allowed UDP too, so reset again
+guard_setup; printf 'UPSTREAM=proxy\nPROXY_HOST=203.0.113.10\nPROXY_PORT=22\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\n' > "$STUB/conf"; gt 1
+cp "$F/good.conf" "$STUB/conf"; gt 1
+expect_eq "restart after proxy -> ssh on the same host:port resets old connections" "$(wc -l < "$STUB/states.log" | tr -d ' ')" "2"
+rm -rf "$STUB"
+
 bad_conf "a host name for VPS_IP" "VPS_IP=vps.example.com"
 bad_conf "an octet over 255" "VPS_IP=203.0.113.300"
 bad_conf "unknown keys" "SSH_OPTS=-o ProxyCommand=evil"
@@ -408,6 +450,13 @@ bad_conf "a probe URL with a host name" "PROBE_URL=https://one.one.one.one/cdn-c
 bad_conf "a bad mask" "TUN_MASK=255.255.255.252"
 bad_conf "a tiny probe interval" "PROBE_INTERVAL=1"
 bad_conf "a bad user" 'SSH_USER=$(id)'
+
+# The app's config model (Swift), when a Swift compiler is around.
+if command -v swiftc >/dev/null; then
+  while IFS= read -r line; do
+    case $line in "ok   "*) ok "${line#ok   }" ;; "FAIL "*) ko "${line#FAIL }" ;; *) [[ -z $line ]] || ko "swift build: $line" ;; esac
+  done < <(tests/swift-model.sh 2>&1)
+else echo "skip swift model tests (no swiftc)"; fi
 
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

@@ -24,7 +24,7 @@ fi
 
 compile() { # arch
   swiftc -O -swift-version 5 -parse-as-library -target "$1-apple-macos13.0" ${FLAGS[@]+"${FLAGS[@]}"} \
-    -framework SystemConfiguration -framework ServiceManagement \
+    -framework SystemConfiguration -framework ServiceManagement -framework UserNotifications \
     app/Sources/Tunlock/*.swift -o "$TMP/Tunlock-$1"
 }
 echo "Compiling Tunlock ${VERSION}..."

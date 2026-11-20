@@ -110,6 +110,22 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
    service. With **Switch modes without a password** checked, it never asks again.
 5. Flip the switch in the menu bar.
 
+<p align="center">
+  <img src="docs/screenshots/en-light-exit.png" width="270" alt="Exit tab: pin by IP, country or both">
+  <img src="docs/screenshots/en-light-activity.png" width="270" alt="Activity tab: events in plain words">
+  <img src="docs/screenshots/en-foreign-menu.png" width="190" alt="The exit changed: pin it or keep it closed">
+</p>
+
+- **Exit tab.** Decide what counts as your exit: the exact IP (strictest), a
+  country (for rotating proxies), or both. **Check the exit now** shows the IP
+  and country, and one click pins them.
+- **Activity tab.** What the background service did, in plain words: exit
+  verified, foreign exit, Mac woke up, SSH dropped. The leak test is here too.
+- **When the exit changes**, the menu says where to, keeps the internet closed
+  and offers **Pin…**, but only for when you changed the server yourself.
+- **Notifications** tell you when the internet closes and when protection
+  returns. Short blips under four seconds are not reported.
+
 The build is ad-hoc signed and not notarized. A copy you build yourself opens
 normally. A downloaded copy needs right-click → **Open** the first time.
 
@@ -131,8 +147,9 @@ sees them: they stay in Karing.
 
 From then on, the Mac may only talk to that proxy. If the proxy blinks, goes
 down, or Karing quits, the internet stops until traffic exits with the proxy's
-IP again. A **rotating** proxy (a new exit IP every few minutes) does not fit:
-Tunlock treats each new IP as a foreign exit and keeps the internet closed.
+IP again. For a **rotating** proxy (a new exit IP every few minutes), set the
+exit to **Country** on the Exit tab: any IP in that country is accepted, any
+other country keeps the internet closed.
 
 <br clear="right">
 
@@ -152,7 +169,9 @@ The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
 | `TUN_ADDR`, `TUN_MASK` | IPv4 of your TUN app's interface; the utun number may change |
 | `TUN_SERVICE` | VPN name from `scutil --nc list` (e.g. `Karing`) to start and stop with Tunlock |
 | `BYPASS_NETS`, `BYPASS_DNS` | exceptions: networks reached directly, and DNS servers per domain |
-| `EXPECTED_EGRESS`, `PROBE_URL`, `PROBE_INTERVAL` | the exit check: which IP, asked where, how often |
+| `EXPECTED_EGRESS` | the pinned exit IP, or `any` to accept any IP (then a country is required) |
+| `EXPECTED_COUNTRY` | two-letter country the exit must be in, e.g. `US`; optional with a pinned IP |
+| `PROBE_URL`, `PROBE_INTERVAL` | the exit check: asked where (an IPv4 literal), how often |
 
 All addresses are IPv4 literals: DNS is blocked outside the tunnel, so names
 could not be resolved to reconnect.
@@ -248,6 +267,19 @@ without a password.
 tests/run.sh               # unit + guard tests against stubbed pfctl, route, curl…; never as root
 sudo tests/pf-syntax.sh    # pfctl parses (never loads) every generated rule set
 ```
+
+On every push, GitHub Actions also runs [`tests/pf-live.sh`](tests/pf-live.sh)
+on a throwaway macOS machine. It loads Tunlock's rules into the **real** pf and
+checks them with real packets: direct IPv4, UDP and IPv6 are blocked, the
+allowed entry and loopback still work, a foreign `quick` rule really opens a
+leak and Tunlock reports it, and removing the rules restores the network. Then
+it runs the real guard with a real `utun` interface: block without a TUN,
+probe when it appears (still no direct traffic), block again when it is gone,
+and rules flushed behind the guard's back come back. A failing baseline fails
+the job instead of passing it. Not covered on CI: the `open` phase, which needs
+a working tunnel to the outside; that one is in the
+[acceptance checklist](docs/TESTING.md). The script refuses to run anywhere
+else, because on a workstation it would cut the network.
 
 The [acceptance checklist](docs/TESTING.md) covers the runs that only a real
 Mac can prove: SSH down, TUN app quit, relay up but exit down, an IPv6 network,

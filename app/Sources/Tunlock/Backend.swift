@@ -8,7 +8,7 @@ enum Paths {
     static let state = ProcessInfo.processInfo.environment["TUNLOCK_UI_STATE"] ?? "/var/run/tunlock/state"
     static let daemon = ProcessInfo.processInfo.environment["TUNLOCK_UI_DAEMON"] ?? "/Library/LaunchDaemons/tunlock.guard.plist"
     static let sudoers = "/etc/sudoers.d/tunlock"
-    static let guardLog = "/var/log/tunlock.log"
+    static let guardLog = ProcessInfo.processInfo.environment["TUNLOCK_UI_LOG"] ?? "/var/log/tunlock.log"
     static var sshLog: String { NSHomeDirectory() + "/Library/Logs/tunlock-ssh.log" }
     static var bundled: String { (Bundle.main.resourcePath ?? "") + "/backend" }
     static var bundledCLI: String { bundled + "/bin/tunlock" }
@@ -129,8 +129,54 @@ struct TunConfig: Equatable {
         }
     }
 
+    var expectedCountry = ""
+
     var isProxy: Bool { upstream == "proxy" }
+    /// The pinned exit IP (empty, or "any" when only the country counts).
     var effectiveEgress: String { expectedEgress.isEmpty ? (isProxy ? proxyHost : vpsIP) : expectedEgress }
+
+    /// What counts as "our" exit.
+    enum ExitMode: String, CaseIterable, Identifiable {
+        case ip, country, both
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .ip: return L("Exact IP", "Точный IP")
+            case .country: return L("Country", "Страна")
+            case .both: return L("IP and country", "IP и страна")
+            }
+        }
+    }
+
+    /// Stored, not derived from the fields: "IP and country" must stay chosen
+    /// while the country is still being typed.
+    var exitMode: ExitMode = .ip {
+        didSet {
+            switch exitMode {
+            case .ip, .both: if expectedEgress == "any" { expectedEgress = "" }
+            case .country: expectedEgress = "any"
+            }
+        }
+    }
+
+    /// Country written to the config: only when the mode uses it.
+    private var countryToWrite: String { exitMode == .ip ? "" : expectedCountry.uppercased() }
+
+    /// Would the guard accept this probe answer?
+    func exitMatches(ip: String, country: String) -> Bool {
+        let ipOK = exitMode == .country || ip == effectiveEgress
+        let countryOK = exitMode == .ip || country.uppercased() == expectedCountry.uppercased()
+        return ipOK && countryOK
+    }
+
+    var exitDescription: String {
+        let c = expectedCountry.isEmpty ? "" : "\(flagEmoji(expectedCountry)) \(countryName(expectedCountry))"
+        switch exitMode {
+        case .ip: return effectiveEgress
+        case .country: return L("any IP in ", "любой IP, страна ") + c
+        case .both: return "\(effectiveEgress) · \(c)"
+        }
+    }
 
     func render() -> String {
         if isProxy { return renderProxy() }
@@ -155,6 +201,7 @@ struct TunConfig: Equatable {
             lines.append("JUMP_PORT=\(jumpPort)")
         }
         if !expectedEgress.isEmpty, expectedEgress != vpsIP { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
+        if !countryToWrite.isEmpty { lines.append("EXPECTED_COUNTRY=\(countryToWrite)") }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -174,6 +221,7 @@ struct TunConfig: Equatable {
         let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
         if !dns.isEmpty { lines.append("BYPASS_DNS=\"\(dns.map { "\($0.domain)=\($0.server)" }.joined(separator: " "))\"") }
         if !expectedEgress.isEmpty, expectedEgress != proxyHost { lines.append("EXPECTED_EGRESS=\(expectedEgress)") }
+        if !countryToWrite.isEmpty { lines.append("EXPECTED_COUNTRY=\(countryToWrite)") }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -204,6 +252,10 @@ struct TunConfig: Equatable {
         c.upstream = values["UPSTREAM"] == "proxy" ? "proxy" : "ssh"
         c.proxyHost = values["PROXY_HOST"] ?? ""
         c.proxyPort = values["PROXY_PORT"] ?? ""
+        c.expectedCountry = values["EXPECTED_COUNTRY"] ?? ""
+        let pinnedAny = c.expectedEgress == "any"
+        c.exitMode = pinnedAny ? .country : (c.expectedCountry.isEmpty ? .ip : .both)
+        if pinnedAny { c.expectedEgress = "any" }
         c.bypassNets = (values["BYPASS_NETS"] ?? "").split(separator: " ").map(String.init)
         c.bypassDNS = (values["BYPASS_DNS"] ?? "").split(separator: " ").compactMap { item in
             let p = item.split(separator: "=", maxSplits: 1).map(String.init)

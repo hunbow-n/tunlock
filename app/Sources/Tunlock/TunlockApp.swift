@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // First launch: nothing to show in the menu yet, so open the setup.
         if !StatusModel.shared.installed { Windows.shared.showSettings() }
+        if Notifier.enabled { Notifier.requestPermission() }
     }
 }
 

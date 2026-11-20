@@ -45,3 +45,16 @@ jobs:
           name: Tunlock-macOS
           path: build/Tunlock.dmg
           if-no-files-found: error
+
+  pf-live:
+    # Real pf on a throwaway runner: tunlock's rules loaded into the live
+    # firewall, checked with real packets. Separate job: it never blocks the DMG.
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Real pf behaviour
+        run: sudo env TUNLOCK_PF_LIVE=1 GITHUB_ACTIONS=true bash tests/pf-live.sh

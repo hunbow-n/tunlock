@@ -31,7 +31,7 @@ is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # ---------------------------------------------------------------- config
 
-CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS PROBE_URL PROBE_INTERVAL PF_ANCHOR'
+CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS EXPECTED_COUNTRY PROBE_URL PROBE_INTERVAL PF_ANCHOR'
 
 # Parse KEY=value lines without sourcing: the guard runs as root.
 load_config() {
@@ -64,7 +64,7 @@ load_config() {
       is_ipv4 "$PROXY_HOST" || die "PROXY_HOST must be the proxy's IPv4 address: DNS is blocked while protected"
       is_port "$PROXY_PORT" || die "PROXY_PORT is not a port"
       : "${EXPECTED_EGRESS:=$PROXY_HOST}"
-      is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address"
+      check_expected
       ENTRY_HOST=$PROXY_HOST ENTRY_PORT=$PROXY_PORT
       FORWARD_ARGS=() HEALTH_HOST='' HEALTH_PORT=''
       parse_common
@@ -77,7 +77,7 @@ load_config() {
   : "${JUMP_USER:=$SSH_USER}" "${JUMP_PORT:=22}"
   is_ipv4 "$VPS_IP" || die "VPS_IP must be an IPv4 address"
   is_ipv4 "$SSH_HOST" || die "SSH_HOST must be an IPv4 address: DNS is blocked while protected"
-  is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address"
+  check_expected
   is_port "$SSH_PORT" || die "SSH_PORT is not a port"
   # Cascade: SSH enters through JUMP_HOST and reaches SSH_HOST from there.
   # Only the entry is reachable outside the tunnel; egress stays EXPECTED_EGRESS.
@@ -109,6 +109,34 @@ parse_common() {
   PROBE_IP=''
   [[ $PROBE_URL =~ ^https://([0-9.]+)(/[A-Za-z0-9._/~-]*)?$ ]] && PROBE_IP=${BASH_REMATCH[1]}
   is_ipv4 "$PROBE_IP" || die "PROBE_URL must be https:// with an IPv4 literal host"
+}
+
+# What a verified exit is:
+#   EXPECTED_EGRESS   one IPv4 (pinned exit), or "any" to accept any address
+#   EXPECTED_COUNTRY  two-letter country code from the probe, e.g. US; optional
+# "any" needs a country: otherwise nothing would be checked at all.
+check_expected() {
+  EXPECTED_COUNTRY=$(tr '[:lower:]' '[:upper:]' <<< "$EXPECTED_COUNTRY")
+  [[ -z $EXPECTED_COUNTRY || $EXPECTED_COUNTRY =~ ^[A-Z]{2}$ ]] || die "EXPECTED_COUNTRY must be a two-letter code like US"
+  if [[ $EXPECTED_EGRESS == any ]]; then
+    [[ -n $EXPECTED_COUNTRY ]] || die "EXPECTED_EGRESS=any needs EXPECTED_COUNTRY, or nothing would be verified"
+  else
+    is_ipv4 "$EXPECTED_EGRESS" || die "EXPECTED_EGRESS must be an IPv4 address or any"
+  fi
+}
+
+# egress_matches ip country: does this probe answer count as our exit?
+egress_matches() {
+  [[ -n $1 ]] || return 1
+  [[ $EXPECTED_EGRESS == any || $1 == "$EXPECTED_EGRESS" ]] || return 1
+  [[ -z $EXPECTED_COUNTRY || $2 == "$EXPECTED_COUNTRY" ]]
+}
+
+# "203.0.113.10 (US)" style description of what is expected.
+expected_desc() {
+  local ip=$EXPECTED_EGRESS
+  [[ $ip == any ]] && ip="any IP"
+  echo "$ip${EXPECTED_COUNTRY:+ in $EXPECTED_COUNTRY}"
 }
 
 is_cidr() {
@@ -440,8 +468,14 @@ net_probe_ip() {
   echo "${base%.*}.$(( ${base##*.} + 1 ))"
 }
 
-route_op() { # add|delete net gateway; a /32 is a host route
-  if [[ $2 == */32 ]]; then route -n "$1" -host "${2%/32}" "$3"; else route -n "$1" -net "$2" "$3"; fi
+route_op() { # add|delete net gateway [modifiers]; a /32 is a host route
+  local action=$1 target=$2 gateway=$3
+  shift 3
+  if [[ $target == */32 ]]; then
+    route -n "$action" -host "${target%/32}" "$gateway" "$@"
+  else
+    route -n "$action" -net "$target" "$gateway" "$@"
+  fi
 }
 
 # Exception networks plus every exception DNS server as a /32: a DNS server
@@ -464,31 +498,42 @@ route_info() {
 # when the gateway address stayed the same. Routes added here are recorded in
 # $RUN_DIR/routes and are the only ones ever removed.
 sync_bypass_routes() {
-  local phys gw net rec keep='' cur_if cur_gw
+  local phys gw src net rec rec_if rec_src keep='' cur_if cur_gw
   phys=$(physical_iface)
   gw=$(physical_gateway)
+  src=''
+  if [[ -n $phys ]]; then
+    src=$(ifconfig "$phys" 2>/dev/null | awk '$1 == "inet" && !ip { ip = $2 } END { print ip }') || src=''
+  fi
   touch "$RUN_DIR/routes"
   for net in $(bypass_targets); do
     [[ $keep != *" $net "* ]] || continue
     keep="$keep $net "
-    [[ -n $phys && $gw =~ ^[0-9.]+$ ]] || continue
+    [[ -n $phys && $gw =~ ^[0-9.]+$ && $src =~ ^[0-9.]+$ ]] || continue
     read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
+    read -r rec rec_if rec_src <<< "$(awk -v n="$net" '$1 == n { print $2, $3, $4; exit }' "$RUN_DIR/routes")"
     if [[ $cur_if == "$phys" && ( -z $cur_gw || $cur_gw == "$gw" || $cur_gw == link#* ) ]]; then
-      continue  # directly connected, or already via today's gateway
+      # Two Wi-Fi networks can share the same gateway address. Rebind only
+      # our route when the interface or its IPv4 address changes.
+      if [[ -z $rec || $cur_gw != "$rec" || ( $rec_if == "$phys" && $rec_src == "$src" ) ]]; then
+        continue
+      fi
     fi
-    rec=$(awk -v n="$net" '$1 == n { print $2 }' "$RUN_DIR/routes")
     if [[ -n $rec ]]; then
-      route_op delete "$net" "$rec" >/dev/null 2>&1 || true
+      if ! route_op delete "$net" "$rec" >/dev/null 2>&1 && [[ $cur_if == "$phys" && $cur_gw == "$rec" ]]; then
+        G_WARNING="could not refresh the exception route for $net"
+        continue
+      fi
       route_forget "$net"
     fi
-    if route_op add "$net" "$gw" >/dev/null 2>&1; then
-      echo "$net $gw" >> "$RUN_DIR/routes"
-      log "exception: $net via $gw ($phys)"
+    if route_op add "$net" "$gw" -ifp "$phys" -ifa "$src" >/dev/null 2>&1; then
+      echo "$net $gw $phys $src" >> "$RUN_DIR/routes"
+      log "exception: $net via $gw ($phys, $src)"
     fi
     read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
     [[ $cur_if == "$phys" ]] || G_WARNING="$net routes via ${cur_if:-nothing}, not $phys (a route tunlock did not create may be in the way)"
   done
-  while read -r net rec; do
+  while read -r net rec _; do
     [[ -n $net && $keep != *" $net "* ]] || continue
     route_op delete "$net" "$rec" >/dev/null 2>&1 || true
     route_forget "$net"
@@ -565,6 +610,7 @@ write_state() {
     echo "egress_country=$G_EGRESS_COUNTRY"
     echo "phys=$G_PHYS"
     echo "expected=$EXPECTED_EGRESS"
+    echo "expected_country=$EXPECTED_COUNTRY"
     echo "pf_enabled=$G_PF_ENABLED"
     echo "pf_rules=$G_PF_RULES"
     echo "pf_anchor=$PF_ANCHOR"
@@ -581,7 +627,8 @@ write_state() {
 guard_sync_rules() {
   local want rules
   if [[ -z $G_TUN ]]; then want=block
-  elif [[ $G_EGRESS_OK == 1 ]]; then want=open
+  # Never open while connections from before protection may still be alive.
+  elif [[ $G_EGRESS_OK == 1 && $G_ARMED == 1 ]]; then want=open
   else want=probe
   fi
   rules=$(render_rules "$want" "$G_TUN" "$G_PHYS")
@@ -735,7 +782,7 @@ guard_tick() {
   # after our rules are confirmed in place.
   if [[ $G_ARMED == 0 && $rules_ok == 1 ]]; then
     if pfctl -F states >/dev/null 2>&1; then
-      touch "$RUN_DIR/armed"
+      policy_fingerprint > "$RUN_DIR/armed"
       G_ARMED=1
       log "protected mode armed, existing connections reset"
     else
@@ -744,19 +791,20 @@ guard_tick() {
   fi
   [[ $G_ARMED == 1 ]] || G_ERROR=${G_ERROR:-"existing connections not reset yet"}
 
-  if [[ -n $G_TUN && $rules_ok == 1 ]]; then
+  if [[ -n $G_TUN && $rules_ok == 1 && $G_ARMED == 1 ]]; then
     local interval=$PROBE_INTERVAL
     [[ $G_EGRESS_OK == 1 ]] || interval=3
     if (( now - G_PROBE_AT >= interval )); then
       G_PROBE_AT=$now
       local loc=''
       read -r ip loc <<< "$(probe_egress || true)"
-      [[ $loc =~ ^[A-Z]{2}$ ]] && G_EGRESS_COUNTRY=$loc
-      if [[ $ip == "$EXPECTED_EGRESS" ]]; then
-        [[ $G_EGRESS_OK == 1 ]] || log "egress verified: $ip via $G_TUN"
+      [[ $loc =~ ^[A-Z]{2}$ ]] || loc=''
+      [[ -z $ip ]] || G_EGRESS_COUNTRY=$loc
+      if egress_matches "$ip" "$loc"; then
+        [[ $G_EGRESS_OK == 1 && $ip == "$G_EGRESS_IP" ]] || log "egress verified: $ip${loc:+ ($loc)} via $G_TUN"
         G_EGRESS_OK=1 G_EGRESS_IP=$ip G_EGRESS_AT=$now
       elif [[ -n $ip ]]; then
-        log "egress MISMATCH: got $ip, expected $EXPECTED_EGRESS; tunnel closed"
+        log "egress MISMATCH: got $ip${loc:+ ($loc)}, expected $(expected_desc); tunnel closed"
         G_EGRESS_OK=0 G_EGRESS_IP=$ip G_EGRESS_AT=$now
       elif [[ $G_EGRESS_OK == 1 ]]; then
         log "egress check got no answer: tunnel closed until verified"
@@ -773,6 +821,13 @@ guard_tick() {
   pf_rules_live || G_ERROR=${G_ERROR:-"anchor rules missing"}
 }
 
+# Everything that may leave outside the tunnel. A change means old pf states
+# may now allow traffic the new policy forbids.
+policy_fingerprint() {
+  # UPSTREAM too: a proxy entry passes TCP and UDP, an SSH entry only TCP.
+  echo "upstream=$UPSTREAM entry=$ENTRY_HOST:$ENTRY_PORT bypass=${BYPASS_LIST[*]-} dns=${DNS_SERVERS[*]-} anchor=$PF_ANCHOR"
+}
+
 guard_init() {
   mkdir -p "$STATE_DIR" "$RUN_DIR"
   chmod 755 "$STATE_DIR" "$RUN_DIR"
@@ -781,7 +836,12 @@ guard_init() {
   G_ENTRY=unknown G_ENTRY_AT=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0
-  if [[ -e $RUN_DIR/armed ]] && pf_rules_live; then G_ARMED=1; fi
+  # ...unless what may pass outside the tunnel changed (another proxy or
+  # server, an exception removed): connections opened under the old policy
+  # keep their pf state, so they must be reset once more.
+  if [[ -e $RUN_DIR/armed && $(cat "$RUN_DIR/armed") == "$(policy_fingerprint)" ]] && pf_rules_live; then
+    G_ARMED=1
+  fi
 }
 
 cmd_guard() {
@@ -1033,7 +1093,10 @@ cmd_status() {
     fi
     printf '%-8s %s\n' SSH "$ssh  $(state_get ssh_endpoint)"
   fi
-  printf '%-8s %s\n' Egress "$e_line  expected $(state_get expected)${tun:+  via $tun}"
+  local exp ec
+  exp=$(state_get expected); ec=$(state_get expected_country)
+  [[ $exp == any ]] && exp="any IP"
+  printf '%-8s %s\n' Egress "$e_line  expected $exp${ec:+ in $ec}${tun:+  via $tun}"
   printf '%-8s %s\n' PF "phase $phase, pf $( [[ $pfe == 1 ]] && echo enabled || echo disabled ), $pfr rules in $(state_get pf_anchor)"
   [[ -z $(state_get bypass) ]] || printf '%-8s %s\n' Direct "$(state_get bypass) (around the tunnel)"
   [[ -z $err ]] || printf '%-8s %s\n' Error "$err"
@@ -1063,9 +1126,12 @@ cmd_test() {
   local phys mode ip r fails=0 missing=0 skipped=0 has6=0
   phys=$(physical_iface)
   mode=$(read_mode)
-  echo "Mode: $mode, physical interface: ${phys:-none}, expected egress: $EXPECTED_EGRESS"
+  echo "Mode: $mode, physical interface: ${phys:-none}, expected egress: $(expected_desc)"
   reach() { curl -gsS --noproxy '*' --connect-timeout 3 --max-time 5 -o /dev/null "$@" >/dev/null 2>&1; }
-  trace() { curl -fsS --noproxy '*' --connect-timeout 4 --max-time 6 "$@" 2>/dev/null | awk -F= '$1 == "ip" { print $2 }'; }
+  trace() { # prints "ip country"
+    curl -fsS --noproxy '*' --connect-timeout 4 --max-time 6 "$@" 2>/dev/null \
+      | awk -F= '$1 == "ip" { ip = $2 } $1 == "loc" { loc = $2 } END { if (ip != "") print ip, loc }'
+  }
   line() { printf '%-5s %-48s %s\n' "$1" "$2" "${3:-}"; }
   check() { # label want(ok|fail) got(ok|fail) detail
     if [[ $mode != protected ]]; then line INFO "$1" "$3${4:+ ($4)}"
@@ -1089,12 +1155,13 @@ cmd_test() {
     [[ -z $conflict ]] && r=ok || r=fail
     check "no other pf rules decide before tunlock" ok "$r" "$conflict"
   fi
-  ip=$(trace -4 --interface "$TUN_ADDR" "$PROBE_URL" || true)
-  [[ $ip == "$EXPECTED_EGRESS" ]] && r=ok || r=fail
-  check "tunnel HTTPS by IP ($PROBE_IP)" ok "$r" "${ip:-no answer}"
-  ip=$(trace -4 https://www.cloudflare.com/cdn-cgi/trace || true)
-  [[ $ip == "$EXPECTED_EGRESS" ]] && r=ok || r=fail
-  check "HTTPS by name, system DNS and route" ok "$r" "${ip:-no answer}"
+  local loc=''
+  read -r ip loc <<< "$(trace -4 --interface "$TUN_ADDR" "$PROBE_URL" || true)"
+  egress_matches "$ip" "$loc" && r=ok || r=fail
+  check "tunnel HTTPS by IP ($PROBE_IP)" ok "$r" "${ip:-no answer}${loc:+ $loc}"
+  read -r ip loc <<< "$(trace -4 https://www.cloudflare.com/cdn-cgi/trace || true)"
+  egress_matches "$ip" "$loc" && r=ok || r=fail
+  check "HTTPS by name, system DNS and route" ok "$r" "${ip:-no answer}${loc:+ $loc}"
 
   if [[ -z $phys ]]; then
     skip "direct IPv4 / UDP / IPv6" "no Wi-Fi or Ethernet connection" 1
@@ -1194,6 +1261,7 @@ tunlock $VERSION: SSH tunnel keeper with a pf kill switch for macOS
   tunlock status      SSH, verified egress IP and pf state  [--porcelain]
   tunlock test        live leak test (sudo)
   tunlock doctor      check the installation
+  tunlock conflicts   pf rules that would decide before tunlock (sudo)
   tunlock config      print the effective configuration
   tunlock ssh-command print the ssh command the keeper runs, change nothing
   tunlock render-rules block|probe|open [utunN [enN]]   print pf rules, change nothing
@@ -1213,6 +1281,10 @@ main() {
     doctor) cmd_doctor "$@" ;;
     guard) cmd_guard ;;
     cleanup) cmd_cleanup ;;
+    conflicts)  # pf rules that decide before tunlock's anchor; exit 1 if any
+      require_root; load_config
+      out=$(pf_conflicts)
+      if [[ -z $out ]]; then echo "none"; else echo "$out"; exit 1; fi ;;
     _guard-ticks)  # tests: run N guard ticks against stubs, then stop
       test_only
       load_config; guard_init

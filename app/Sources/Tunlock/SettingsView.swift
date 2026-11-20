@@ -11,6 +11,9 @@ struct SettingsView: View {
     @State private var sshCheck: Check = .idle
     @State private var ipCheck: Check = .idle
     @State private var seenIP: String?
+    @State private var seenCountry = ""
+    @State private var tab: Tab
+    @AppStorage("notify") private var notify = true
     @State private var proxyCheck: Check = .idle
     @State private var saving = false
     @State private var saveError: String?
@@ -25,40 +28,61 @@ struct SettingsView: View {
         case idle, running, ok(String), failed(String)
     }
 
+    enum Tab: Hashable { case connection, exit, exceptions, activity, general }
+
+    init(tab: Tab = .connection) { _tab = State(initialValue: tab) }
+
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                if !model.installed { welcome }
-                upstreamSection
-                if config.isProxy { proxySection } else { serverSection }
-                tunnelSection
-                checkSection
-                exceptionsSection
-                behaviourSection
+            if !model.installed { welcome }
+            TabView(selection: $tab) {
+                Form {
+                    upstreamSection
+                    if config.isProxy { proxySection } else { serverSection }
+                    tunnelSection
+                }
+                .formStyle(.grouped)
+                .tabItem { Text(L("Connection", "Подключение")) }.tag(Tab.connection)
+
+                Form { exitSection }
+                    .formStyle(.grouped)
+                    .tabItem { Text(L("Exit", "Выход")) }.tag(Tab.exit)
+
+                Form { exceptionsSection }
+                    .formStyle(.grouped)
+                    .tabItem { Text(L("Exceptions", "Исключения")) }.tag(Tab.exceptions)
+
+                ActivityView()
+                    .tabItem { Text(L("Activity", "Журнал")) }.tag(Tab.activity)
+
+                Form { behaviourSection; dangerSection }
+                    .formStyle(.grouped)
+                    .tabItem { Text(L("General", "Общие")) }.tag(Tab.general)
             }
-            .formStyle(.grouped)
+            .padding(.top, 8)
             Divider()
-            bottomBar.padding(16)
+            bottomBar.padding(.horizontal, 16).padding(.vertical, 12)
         }
-        .frame(width: 560, height: model.installed ? 640 : 760)
+        .frame(width: 600, height: 620)
         .onChange(of: config) { _ in saved = false }
     }
 
     // MARK: sections
 
+    /// First launch: three steps, one line each, above the tabs.
     private var welcome: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(L("Welcome to Tunlock", "Добро пожаловать в Tunlock")).font(.title2.weight(.semibold))
-                Text(L("Tunlock lets this Mac reach the internet only through your own server over SSH. If the tunnel breaks, the internet stays blocked instead of quietly using your real IP.",
-                       "Tunlock пускает Mac в интернет только через ваш сервер по SSH. Если туннель обрывается, интернет остаётся заблокированным и не уходит молча через ваш настоящий IP."))
-                    .foregroundStyle(.secondary)
-                Text(L("1. Enter your server.  2. Turn on your TUN app (Karing, sing-box…) and pick its interface.  3. Save. Then switch modes from the menu bar.",
-                       "1. Укажите сервер.  2. Включите TUN-приложение (Karing, sing-box…) и выберите его интерфейс.  3. Сохраните. Дальше режимы переключаются из строки меню."))
-                    .font(.callout)
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "lock.shield.fill").font(.system(size: 28)).foregroundStyle(.green)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L("Set up Tunlock in three steps", "Настройка Tunlock в три шага")).font(.headline)
+                Text(L("1. Connection: your server or proxy, and the TUN app's interface.  2. Exit: check and pin it.  3. Save and apply.",
+                       "1. Подключение: сервер или прокси и интерфейс TUN-приложения.  2. Выход: проверьте и закрепите.  3. Сохраните."))
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.vertical, 4)
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.green.opacity(0.08))
     }
 
     private var serverSection: some View {
@@ -156,7 +180,7 @@ struct SettingsView: View {
                 }
             }
             HStack {
-                Picker(L("TUN interface", "TUN-интерфейс"), selection: tunSelection) {
+                Picker(L("TUN app's interface", "Интерфейс TUN-приложения"), selection: tunSelection) {
                     Text(L("Choose…", "Выберите…")).tag("")
                     ForEach(tuns) { t in Text("\(t.name) · \(t.address)/\(t.prefix)").tag(t.address + "|" + t.mask) }
                     if !config.tunAddr.isEmpty, !tuns.contains(where: { $0.address == config.tunAddr }) {
@@ -164,47 +188,90 @@ struct SettingsView: View {
                     }
                 }
                 Button {
-                    tuns = tunInterfaces()
+                    rescanTuns()
                 } label: { Image(systemName: "arrow.clockwise") }
                     .help(L("Rescan interfaces", "Найти интерфейсы заново"))
             }
+            .onAppear { if config.tunAddr.isEmpty { rescanTuns() } }
+            // Until an interface is chosen, keep looking: turning the TUN app on is enough.
+            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+                if config.tunAddr.isEmpty { rescanTuns() }
+            }
+            tunStatus
         } header: {
             Text(L("Tunnel", "Туннель"))
         } footer: {
             FooterText(config.isProxy
-                 ? L("Turn your TUN app on with the proxy profile, then pick its interface here. The number (utunN) may change later; the address may not.",
-                     "Включите TUN-приложение с профилем прокси и выберите здесь его интерфейс. Номер utunN потом может меняться, адрес — нет.")
+                 ? L("Turn your TUN app on with the proxy profile, in TUN mode. Tunlock spots its interface and asks you to confirm it.",
+                     "Включите TUN-приложение с профилем прокси в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить.")
                  : config.forward == .custom
                  ? L("Only -L and -D are accepted.", "Допускаются только -L и -D.")
-                 : L("In your TUN app, point the proxy at 127.0.0.1:\(config.localPort). Turn the TUN app on, then pick its interface here. The number (utunN) may change later; the address may not.",
-                     "В TUN-приложении укажите прокси 127.0.0.1:\(config.localPort). Включите его и выберите здесь интерфейс. Номер utunN потом может меняться, адрес — нет."))
+                 : L("In your TUN app, point the proxy at 127.0.0.1:\(config.localPort) and turn it on in TUN mode. Tunlock spots its interface and asks you to confirm it.",
+                     "В TUN-приложении укажите прокси 127.0.0.1:\(config.localPort) и включите его в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить."))
         }
     }
 
-    private var checkSection: some View {
-        Section {
-            TextField(L("Expected exit IP", "Ожидаемый выходной IP"), text: $config.expectedEgress,
-                      prompt: Text(config.effectiveEgress.isEmpty
-                                   ? (config.isProxy ? L("same as the proxy", "как у прокси") : L("same as server", "как у сервера"))
-                                   : config.effectiveEgress))
-            HStack {
-                Button(L("Check exit IP now", "Проверить IP сейчас"), action: checkIP)
-                    .disabled(config.tunAddr.isEmpty || ipCheck == .running)
-                checkLabel(ipCheck)
-            }
-            if let ip = seenIP, ip != config.effectiveEgress {
-                Button(L("Use \(ip) as the expected exit IP", "Использовать \(ip) как ожидаемый выходной IP")) {
-                    config.expectedEgress = ip
-                    ipCheck = .ok(L("\(ip): will be expected", "\(ip): будет ожидаться"))
+    private var exitSection: some View {
+        Group {
+            Section {
+                Picker(L("Count as my exit", "Своим выходом считать"), selection: $config.exitMode) {
+                    ForEach(TunConfig.ExitMode.allCases) { Text($0.title).tag($0) }
                 }
-                .buttonStyle(.link)
+                .pickerStyle(.segmented)
+                if config.exitMode != .country {
+                    TextField(L("Exit IP", "Выходной IP"), text: Binding(
+                        get: { config.expectedEgress == "any" ? "" : config.expectedEgress },
+                        set: { config.expectedEgress = $0 }),
+                              prompt: Text(config.isProxy ? (config.proxyHost.isEmpty ? L("same as the proxy", "как у прокси") : config.proxyHost)
+                                                          : (config.vpsIP.isEmpty ? L("same as server", "как у сервера") : config.vpsIP)))
+                }
+                if config.exitMode != .ip {
+                    HStack {
+                        TextField(L("Country code", "Код страны"), text: $config.expectedCountry, prompt: Text("US"))
+                        if config.expectedCountry.count == 2 {
+                            Text("\(flagEmoji(config.expectedCountry)) \(countryName(config.expectedCountry.uppercased()))")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text(L("Expected exit", "Ожидаемый выход"))
+            } footer: {
+                FooterText(L("Exact IP is the strictest: any change closes the internet. Choose Country for proxies that rotate their IP: any address in that country is accepted, anything else is blocked.",
+                             "Точный IP — самый строгий вариант: любая смена закрывает интернет. «Страна» — для прокси с меняющимся IP: подойдёт любой адрес в этой стране, всё остальное блокируется."))
             }
-        } header: {
-            Text(L("Exit check", "Проверка выхода"))
-        } footer: {
-            FooterText(L("Tunlock asks 1.1.1.1 which IP the tunnel exits from, and opens the internet only when it matches.",
-                   "Tunlock спрашивает у 1.1.1.1, с какого IP выходит туннель, и открывает интернет только при совпадении."))
+            Section {
+                HStack {
+                    Button(L("Check the exit now", "Проверить выход сейчас"), action: checkIP)
+                        .disabled(config.tunAddr.isEmpty || ipCheck == .running)
+                    checkLabel(ipCheck)
+                }
+                if let ip = seenIP, !config.exitMatches(ip: ip, country: seenCountry) {
+                    Button(L("Pin this exit: \(ip) \(flagEmoji(seenCountry))", "Закрепить этот выход: \(ip) \(flagEmoji(seenCountry))"), action: pinSeen)
+                        .buttonStyle(.borderedProminent)
+                }
+            } header: {
+                Text(L("Current exit", "Текущий выход"))
+            } footer: {
+                FooterText(L("Tunlock asks 1.1.1.1, through the tunnel, which IP and country the traffic exits from, and opens the internet only when they match.",
+                             "Tunlock спрашивает у 1.1.1.1 через туннель, с какого IP и из какой страны выходит трафик, и открывает интернет только при совпадении."))
+            }
         }
+    }
+
+    /// Pin what the check just saw, in the current mode.
+    private func pinSeen() {
+        guard let ip = seenIP else { return }
+        if config.exitMode != .ip, seenCountry.count != 2 {
+            ipCheck = .failed(L("The country is unknown: check again", "Страна не определилась: проверьте ещё раз"))
+            return
+        }
+        switch config.exitMode {
+        case .ip: config.expectedEgress = ip
+        case .country: config.expectedCountry = seenCountry
+        case .both: config.expectedEgress = ip; config.expectedCountry = seenCountry
+        }
+        ipCheck = .ok(L("Pinned: press Save and apply", "Закреплено: нажмите «Сохранить и применить»"))
     }
 
     private var exceptionsSection: some View {
@@ -266,6 +333,8 @@ struct SettingsView: View {
     private var behaviourSection: some View {
         Section {
             Toggle(L("Switch modes without a password", "Переключать режимы без пароля"), isOn: $passwordless)
+            Toggle(L("Notify when the internet closes or protection returns", "Уведомлять, когда интернет закрылся или защита вернулась"), isOn: $notify)
+                .onChange(of: notify) { on in if on { Notifier.requestPermission() } }
             Toggle(L("Show the exit country flag in the menu bar", "Показывать флаг страны выхода в строке меню"), isOn: $showFlag)
             Toggle(L("Open Tunlock at login", "Открывать Tunlock при входе"), isOn: $launchAtLogin)
                 .onChange(of: launchAtLogin) { on in
@@ -280,18 +349,102 @@ struct SettingsView: View {
         }
     }
 
-    private var bottomBar: some View {
-        HStack(alignment: .center) {
-            if model.installed {
-                Button(L("Uninstall…", "Удалить…"), role: .destructive) { confirmUninstall = true }
+    @ViewBuilder
+    private var dangerSection: some View {
+        if model.installed {
+            Section {
+                Button(L("Uninstall Tunlock…", "Удалить Tunlock…"), role: .destructive) { confirmUninstall = true }
                     .confirmationDialog(L("Remove Tunlock's service and rules?", "Удалить службу и правила Tunlock?"),
                                         isPresented: $confirmUninstall) {
                         Button(L("Uninstall", "Удалить"), role: .destructive) { model.uninstall() }
                     } message: {
                         Text(L("Direct internet will be allowed again, and the settings deleted.", "Прямой интернет снова будет разрешён, настройки удалятся."))
                     }
+            } footer: {
+                FooterText(L("Removes the background service, its firewall rules and settings. Your TUN app is not touched.",
+                             "Удаляет фоновую службу, её правила файрвола и настройки. TUN-приложение не затрагивается."))
             }
-            if let saveError {
+        }
+    }
+
+    /// Why Save is unavailable, and the tab that fixes it; nil when it can be pressed.
+    private var saveBlocker: (text: String, tab: Tab)? {
+        if config.isProxy {
+            if config.proxyHost.isEmpty || config.proxyPort.isEmpty {
+                return (L("Enter the proxy's IP and port", "Укажите IP и порт прокси"), .connection)
+            }
+        } else if config.vpsIP.isEmpty {
+            return (L("Enter your server's IP", "Укажите IP сервера"), .connection)
+        }
+        if config.tunAddr.isEmpty {
+            return (L("Turn the TUN app on in TUN mode and confirm its interface", "Включите TUN-приложение в режиме TUN и подтвердите его интерфейс"), .connection)
+        }
+        if config.exitMode != .ip, config.expectedCountry.count != 2 {
+            return (L("Enter the exit's two-letter country code", "Укажите двухбуквенный код страны выхода"), .exit)
+        }
+        return nil
+    }
+
+    private func tabName(_ t: Tab) -> String {
+        switch t {
+        case .connection: return L("Connection", "Подключение")
+        case .exit: return L("Exit", "Выход")
+        case .exceptions: return L("Exceptions", "Исключения")
+        case .activity: return L("Activity", "Журнал")
+        case .general: return L("General", "Общие")
+        }
+    }
+
+    /// Whether a TUN interface is seen, and what to do. Tunlock cannot tell which
+    /// app owns an interface, so it proposes and the user confirms.
+    @ViewBuilder
+    private var tunStatus: some View {
+        let app = config.tunService.isEmpty ? L("your TUN app", "TUN-приложение") : config.tunService
+        if let t = tuns.first(where: { $0.address == config.tunAddr }) {
+            Label(L("Using \(t.name) · \(t.address)", "Используется \(t.name) · \(t.address)"), systemImage: "checkmark.circle.fill")
+                .font(.callout).foregroundStyle(.green)
+        } else if tuns.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(L("Waiting for \(app)… Turn it on in TUN (VPN) mode, not \"system proxy\". Tunlock notices it by itself.",
+                       "Жду \(app)… Включите его в режиме TUN (VPN), а не «системный прокси». Tunlock заметит это сам."))
+                    .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        } else if config.tunAddr.isEmpty, tuns.count == 1, let t = tuns.first {
+            HStack(spacing: 10) {
+                Text(L("Found \(t.name) · \(t.address). Is it \(app)'s?", "Найден \(t.name) · \(t.address). Это интерфейс \(app)?"))
+                    .font(.callout).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button(L("Yes, use it", "Да, использовать")) { config.tunAddr = t.address; config.tunMask = t.mask }
+            }
+        } else if config.tunAddr.isEmpty {
+            Label(L("Several interfaces found: pick \(app)'s in the list. Not sure? Turn \(app) off and on, and see which one appears.",
+                    "Найдено несколько интерфейсов: выберите в списке интерфейс \(app). Не уверены? Выключите и включите \(app) и посмотрите, какой появится."),
+                  systemImage: "hand.point.up.left.fill")
+                .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        } else {
+            Label(L("\(config.tunAddr) is not up now: turn \(app) on.", "\(config.tunAddr) сейчас не поднят: включите \(app)."),
+                  systemImage: "moon.fill")
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Only refreshes the list; choosing stays with the user (see tunStatus).
+    private func rescanTuns() { tuns = tunInterfaces() }
+
+    private var bottomBar: some View {
+        HStack(alignment: .center) {
+            if let blocker = saveBlocker, saveError == nil {
+                // One concrete step, and a jump to the tab where it is done.
+                Button {
+                    tab = blocker.tab
+                } label: {
+                    Label(blocker.text + (tab == blocker.tab ? "" : " → " + tabName(blocker.tab)), systemImage: "arrow.right.circle")
+                        .font(.callout)
+                }
+                .buttonStyle(.link)
+                .fixedSize(horizontal: false, vertical: true)
+            } else if let saveError {
                 Text(saveError).font(.caption).foregroundStyle(.red).lineLimit(3).textSelection(.enabled)
             } else if saved {
                 Label(L("Applied", "Применено"), systemImage: "checkmark.circle.fill").foregroundStyle(.green)
@@ -303,8 +456,7 @@ struct SettingsView: View {
             if saving { ProgressView().controlSize(.small) }
             Button(L("Save and apply", "Сохранить и применить"), action: save)
                 .keyboardShortcut(.defaultAction)
-                .disabled(saving || config.tunAddr.isEmpty
-                          || (config.isProxy ? config.proxyHost.isEmpty || config.proxyPort.isEmpty : config.vpsIP.isEmpty))
+                .disabled(saving || saveBlocker != nil)
         }
     }
 
@@ -375,12 +527,16 @@ struct SettingsView: View {
         Task {
             let r = await run("/usr/bin/curl", ["-4fsS", "--noproxy", "*", "--interface", c.tunAddr,
                                                 "--connect-timeout", "4", "--max-time", "6", "https://1.1.1.1/cdn-cgi/trace"])
-            let ip = r.output.split(separator: "\n").first { $0.hasPrefix("ip=") }.map { String($0.dropFirst(3)) }
+            let lines = r.output.split(separator: "\n")
+            let ip = lines.first { $0.hasPrefix("ip=") }.map { String($0.dropFirst(3)) }
+            let loc = lines.first { $0.hasPrefix("loc=") }.map { String($0.dropFirst(4)) } ?? ""
             seenIP = ip
-            if let ip, ip == c.effectiveEgress {
-                ipCheck = .ok(L("\(ip): matches", "\(ip): совпадает"))
-            } else if let ip {
-                ipCheck = .failed(L("\(ip): does not match \(c.effectiveEgress)", "\(ip): не совпадает с \(c.effectiveEgress)"))
+            seenCountry = loc
+            let seen = ip.map { "\($0) \(flagEmoji(loc)) \(countryName(loc))" } ?? ""
+            if let ip, c.exitMatches(ip: ip, country: loc) {
+                ipCheck = .ok(L("\(seen): matches", "\(seen): совпадает"))
+            } else if ip != nil {
+                ipCheck = .failed(L("\(seen): expected \(c.exitDescription)", "\(seen): ожидается \(c.exitDescription)"))
             } else {
                 ipCheck = .failed(L("No answer through the tunnel", "Нет ответа через туннель"))
             }

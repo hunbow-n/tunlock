@@ -85,6 +85,10 @@ final class StatusModel: ObservableObject {
 
     private var meter = RateMeter()
     private var timer: Timer?
+    // Notifications fire only for a state that held for a few seconds.
+    private var shownVerdict: Verdict?
+    private var pendingVerdict: Verdict?
+    private var pendingSince = Date()
 
     private init() {
         refresh()
@@ -117,6 +121,7 @@ final class StatusModel: ObservableObject {
             rate = nil
         }
         checkDirectIP()
+        trackVerdict()
     }
 
     private func checkDirectIP() {
@@ -205,6 +210,77 @@ final class StatusModel: ObservableObject {
         refresh()
         if r.cancelled { return L("Cancelled.", "Отменено.") }
         return r.ok ? nil : r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func trackVerdict() {
+        let v = verdict
+        if v != pendingVerdict {
+            pendingVerdict = v
+            pendingSince = Date()
+            return
+        }
+        guard v != shownVerdict, Date().timeIntervalSince(pendingSince) >= 4 else { return }
+        defer { shownVerdict = v }
+        guard let from = shownVerdict, busy == nil else { return }  // not at launch, not for our own switching
+        let s = state
+        let exit = [s["egress_ip"] ?? "", s["egress_country"].map { "\(flagEmoji($0)) \(countryName($0))" } ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        switch v {
+        case .protected where from != .direct && from != .notSetUp:
+            Notifier.post(L("Protected again", "Снова защищено"), L("Exit ", "Выход ") + exit)
+        case .blocked where from == .protected:
+            Notifier.post(L("Internet closed", "Интернет закрыт"), closeReason())
+        case .unprotected:
+            Notifier.post(L("Protection is not in force", "Защита не действует"),
+                          s["pf_conflict"].flatMap { $0.isEmpty ? nil : $0 } ?? s["error"] ?? "")
+        case .notRunning where from == .protected || from == .blocked:
+            Notifier.post(L("Tunlock service not responding", "Служба Tunlock не отвечает"),
+                          L("Open Tunlock to see what happened.", "Откройте Tunlock, чтобы посмотреть, что случилось."))
+        default:
+            break
+        }
+    }
+
+    /// Why the guard closed the internet, in one line.
+    func closeReason() -> String {
+        let s = state
+        if let ip = s["egress_ip"], !ip.isEmpty, exitIsForeign {
+            return L("The exit changed to ", "Выход сменился на ") + ip + " " + flagEmoji(s["egress_country"] ?? "")
+        }
+        if s["upstream"] != "proxy", s["ssh"] == "down" { return L("SSH dropped. Waiting for it to reconnect.", "SSH отвалился. Жду переподключения.") }
+        if (s["tun"] ?? "").isEmpty { return L("The TUN app is off.", "TUN-приложение выключено.") }
+        return L("The exit did not answer. Waiting for a verified tunnel.", "Выход не ответил. Жду подтверждённый туннель.")
+    }
+
+    /// The last probe answered, but not with our exit.
+    var exitIsForeign: Bool {
+        let s = state
+        guard s["egress_ok"] != "1", let ip = s["egress_ip"], !ip.isEmpty else { return false }
+        let expected = s["expected"] ?? "", cc = s["expected_country"] ?? ""
+        return (expected != "any" && ip != expected) || (!cc.isEmpty && s["egress_country"] != cc)
+    }
+
+    /// Pin exactly the exit the user confirmed (not whatever the state says by
+    /// the time they click). The current mode is kept: IP, country or both.
+    func pinExit(ip: String, country cc: String) {
+        guard var config = TunConfig.loadInstalled(), !ip.isEmpty else { return }
+        if config.exitMode != .ip, cc.count != 2 {
+            message = L("The exit's country is unknown: check again before pinning.",
+                        "Страна выхода не определилась: проверьте ещё раз, прежде чем закреплять.")
+            return
+        }
+        switch config.exitMode {
+        case .ip: config.expectedEgress = ip
+        case .country: config.expectedCountry = cc
+        case .both: config.expectedEgress = ip; config.expectedCountry = cc
+        }
+        busy = L("Pinning the new exit…", "Закрепляю новый выход…")
+        Task {
+            let error = await apply(config, passwordless: FileManager.default.fileExists(atPath: Paths.sudoers))
+            busy = nil
+            message = error
+            refresh()
+        }
     }
 
     func uninstall() {

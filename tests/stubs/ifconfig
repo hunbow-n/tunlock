@@ -9,6 +9,12 @@ if [[ ${2:-} == down ]]; then
 fi
 [[ ${1:-} != -a ]] || exit 0  # full listing: nothing beyond TUNLOCK_TEST_IFCONFIG
 [[ ! -e $STUB/ifconfig_read_fail ]] || exit 1
+if [[ $1 == en0 ]]; then
+  ip=192.168.1.45
+  [[ ! -s $STUB/physical_ipv4 ]] || read -r ip < "$STUB/physical_ipv4"
+  echo "  inet $ip netmask 0xffffff00"
+  exit 0
+fi
 if grep -qxF -- "$1" "$STUB/down.log" 2>/dev/null </dev/null; then
   echo "$1: flags=8050<POINTOPOINT,RUNNING,MULTICAST> mtu 1500"
 else

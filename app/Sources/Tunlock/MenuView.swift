@@ -15,6 +15,7 @@ struct MenuView: View {
         let v = model.verdict
         VStack(alignment: .leading, spacing: 12) {
             header(v)
+            if model.mode == "protected", model.exitIsForeign { foreignExitCard }
             if v == .notSetUp {
                 Button {
                     Windows.shared.showSettings()
@@ -59,6 +60,41 @@ struct MenuView: View {
         .frame(width: 340)
     }
 
+    @State private var confirmPin = false
+    /// The exit shown in the confirmation; pinned as is, even if a newer probe arrives.
+    @State private var pinTarget: (ip: String, country: String) = ("", "")
+
+    /// The exit answered from somewhere else: say so, and offer one way out.
+    private var foreignExitCard: some View {
+        let s = model.state
+        let ip = s["egress_ip"] ?? ""
+        let cc = s["egress_country"] ?? ""
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(ip) \(flagEmoji(cc)) \(countryName(cc))").font(.callout.weight(.medium)).textSelection(.enabled)
+                Text(L("Your server or proxy now? Pin it. If not, leave it closed.",
+                       "Это ваш новый сервер или прокси? Закрепите. Если нет — оставьте закрытым."))
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 4)
+            Button(L("Pin…", "Закрепить…")) { pinTarget = (ip, cc); confirmPin = true }
+                .disabled(model.busy != nil)
+                .confirmationDialog(L("Make \(pinTarget.ip) \(flagEmoji(pinTarget.country)) your exit?",
+                                      "Сделать \(pinTarget.ip) \(flagEmoji(pinTarget.country)) своим выходом?"),
+                                    isPresented: $confirmPin) {
+                    Button(L("Pin \(pinTarget.ip)", "Закрепить \(pinTarget.ip)")) {
+                        model.pinExit(ip: pinTarget.ip, country: pinTarget.country)
+                    }
+                } message: {
+                    Text(L("Only if you changed the server or proxy yourself. If not, someone else's exit is in the way: keep the internet closed.",
+                           "Только если вы сами сменили сервер или прокси. Если нет, на пути чужой выход: оставьте интернет закрытым."))
+                }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+    }
+
     // MARK: header
 
     private func header(_ v: Verdict) -> some View {
@@ -77,7 +113,8 @@ struct MenuView: View {
                         }
                     }
                 } else {
-                    Text(v.explanation).font(.callout).foregroundStyle(.secondary)
+                    Text(v == .blocked && model.mode == "protected" ? model.closeReason() : v.explanation)
+                        .font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -168,6 +205,12 @@ struct MenuView: View {
 
     private func exitDetail(_ s: [String: String]) -> String {
         let expected = s["expected"] ?? ""
+        if model.exitIsForeign {
+            let cc = s["expected_country"] ?? ""
+            let want = expected == "any" ? L("any IP", "любой IP") : expected
+            return L("expected ", "ожидается ") + want + (cc.isEmpty ? "" : " \(flagEmoji(cc))")
+                + L(" · seen ", " · виден ") + (s["egress_ip"] ?? "") + " " + flagEmoji(s["egress_country"] ?? "")
+        }
         var parts = [expected]
         if let c = s["egress_country"], !c.isEmpty { parts.append("\(flagEmoji(c)) \(countryName(c))") }
         if s["upstream"] != "proxy", s["ssh"] != "up" {
