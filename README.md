@@ -364,6 +364,11 @@ sudo ./uninstall.sh --purge    # also deletes the config
 | [killswitch](https://github.com/vpn-kill-switch/killswitch) | CLI; allows all TCP/UDP to the VPN IP and flushes pf with `-Fa` |
 | [Vigil](https://github.com/ursasi/vigil), [TunnelBar](https://github.com/tanmay-kulkarni/TunnelBar), [SSH Tunnel Manager](https://github.com/0fuz/ssh-tunnel-manager) | keep SSH tunnels up from the menu bar; no kill switch |
 
+## Contributing
+
+See [AGENTS.md](AGENTS.md) for the issue and pull request workflow,
+test commands, and release conventions.
+
 ## License
 
 [MIT](LICENSE)
