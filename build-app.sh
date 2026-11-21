@@ -6,7 +6,11 @@ cd "$(dirname "$0")"
 ROOT=$PWD
 OUT=$ROOT/build
 APP=$OUT/Tunlock.app
-VERSION=$(awk -F= '$1 == "VERSION" { print $2; exit }' bin/tunlock)
+VERSION=${TUNLOCK_BUILD_VERSION:-$(awk -F= '$1 == "VERSION" { print $2; exit }' bin/tunlock)}
+if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Invalid Tunlock build version: $VERSION" >&2
+  exit 1
+fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -42,7 +46,7 @@ done
 sed "s/@VERSION@/$VERSION/g" app/Info.plist > "$APP/Contents/Info.plist"
 cp app/Resources/AppIcon.icns "$APP/Contents/Resources/"
 B=$APP/Contents/Resources/backend
-cp bin/tunlock "$B/bin/"
+sed "s/^VERSION=.*/VERSION=$VERSION/" bin/tunlock > "$B/bin/tunlock"
 lipo -create "$TMP/sleepwatch-arm64" "$TMP/sleepwatch-x86_64" -output "$B/bin/tunlock-sleepwatch"
 cp install.sh uninstall.sh tunlock.conf.example "$B/"
 cp launchd/*.plist "$B/launchd/"

@@ -9,16 +9,58 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'tunlock-release' || github.run_id }}
+  queue: max
+
 jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    outputs:
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'push' && '0' || '1' }}
+
+      - name: Determine release version and notes
+        id: release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous_tag=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+          if [[ -n "$previous_tag" ]]; then
+            if [[ ! "$previous_tag" =~ ^v([0-9]+\.[0-9]+)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Cannot increment release tag $previous_tag" >&2
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1))"
+            previous_commit=$(git rev-parse "refs/tags/${previous_tag}^{commit}")
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$previous_commit"; then
+              echo "This commit is already covered by $previous_tag."
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor "$previous_commit" "$GITHUB_SHA"; then
+              echo "This commit does not descend from $previous_tag." >&2
+              exit 1
+            fi
+            range="$previous_commit..$GITHUB_SHA"
+          else
+            version=$(awk -F= '$1 == "VERSION" { print $2; exit }' bin/tunlock)
+            range="$GITHUB_SHA"
+          fi
+          mkdir -p build
+          git log --format='- %s' "$range" > build/release-notes.md
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "TUNLOCK_BUILD_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: bash tests/run.sh
@@ -66,6 +108,7 @@ jobs:
             build/Tunlock.dmg
             build/SHA256SUMS.txt
             build/SHA256SUMS.txt.sig
+            build/release-notes.md
           if-no-files-found: error
 
   pf-live:
@@ -80,3 +123,63 @@ jobs:
 
       - name: Real pf behaviour
         run: sudo env TUNLOCK_PF_LIVE=1 GITHUB_ACTIONS=true bash tests/pf-live.sh
+
+  release:
+    needs: [build, pf-live]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: Tunlock-macOS
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIOUS_TAG: ${{ needs.build.outputs.previous_tag }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          latest_tag=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+          if [[ "$latest_tag" != "$PREVIOUS_TAG" ]]; then
+            echo "A release was published after this build was prepared. Current release: $latest_tag."
+            exit 0
+          fi
+          sha256sum --check SHA256SUMS.txt
+          assets=(Tunlock.dmg SHA256SUMS.txt)
+          if [[ -f SHA256SUMS.txt.sig ]]; then
+            assets+=(SHA256SUMS.txt.sig)
+          fi
+
+          tag_ref="refs/tags/$RELEASE_TAG"
+          tagged_commit=$(git ls-remote "$GITHUB_SERVER_URL/$GH_REPO.git" "$tag_ref" "$tag_ref^{}" \
+            | awk 'NR == 1 || /\^\{\}$/ { commit = $1 } END { print commit }')
+          if [[ -z "$tagged_commit" ]]; then
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="$tag_ref" -f sha="$GITHUB_SHA" --silent
+          elif [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+            echo "Tag $RELEASE_TAG already points to $tagged_commit instead of $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          # gh stages assets in a draft. Resume an interrupted upload for this commit.
+          draft=$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft and .tag_name == env.RELEASE_TAG) | [.target_commitish, any(.assets[]; .name == "SHA256SUMS.txt.sig")] | @tsv')
+          IFS=$'\t' read -r draft_target draft_signed <<< "$draft"
+          if [[ -z "$draft_target" ]]; then
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --target "$GITHUB_SHA" \
+              --title "Tunlock ${RELEASE_TAG#v}" --notes-file release-notes.md \
+              --latest --draft=false --prerelease=false
+          elif [[ "$draft_target" == "$GITHUB_SHA" ]]; then
+            if [[ "$draft_signed" == true && ! -f SHA256SUMS.txt.sig ]]; then
+              echo "Cannot replace a signed draft with an unsigned build." >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md --draft=false --prerelease=false --latest
+          else
+            echo "Draft $RELEASE_TAG targets $draft_target instead of $GITHUB_SHA." >&2
+            exit 1
+          fi

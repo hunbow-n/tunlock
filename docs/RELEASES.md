@@ -1,5 +1,13 @@
 # Verifying a release
 
+On each push to `main`, GitHub Actions queues the release build. After the
+build and live PF tests pass, it publishes a regular GitHub Release with the
+next patch version. The app and bundled CLI use that version. The release
+notes list commit subjects since the previous release tag.
+
+If an upload fails after the tag is created, rerun the failed publication
+job to resume the release for that commit.
+
 Every DMG is built on GitHub Actions, never on someone's computer. The build
 publishes `SHA256SUMS.txt` next to the DMG. Once the owner has set a release key,
 it also publishes `SHA256SUMS.txt.sig`, an Ed25519 signature made with a private
