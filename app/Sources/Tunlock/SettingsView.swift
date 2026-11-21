@@ -126,6 +126,7 @@ struct SettingsView: View {
                         Button(L("Pin this exit instead: \(ip) \(flagEmoji(seenCountry))",
                                  "Закрепить вместо этого выход: \(ip) \(flagEmoji(seenCountry))"), action: pinSeen)
                     }
+                    aiSeenRows
                 }
                 if !config.extras.isEmpty {
                     Section {
@@ -487,6 +488,7 @@ struct SettingsView: View {
                     Button(L("Pin this exit: \(ip) \(flagEmoji(seenCountry))", "Закрепить этот выход: \(ip) \(flagEmoji(seenCountry))"), action: pinSeen)
                         .buttonStyle(.borderedProminent)
                 }
+                aiSeenRows
             } header: {
                 Text(L("Current exit", "Текущий выход"))
             } footer: {
@@ -762,16 +764,25 @@ struct SettingsView: View {
     /// Which check is current; results of an older one (another draft, another
     /// interface) are dropped when they arrive.
     @State private var checkToken = UUID()
+    /// What the AI services saw in the last check.
+    @State private var aiSeen: [(host: String, ip: String, country: String)] = []
 
     private func checkIP() {
         ipCheck = .running
         seenIP = nil
         seenCountry = ""
+        aiSeen = []
         let c = config, token = UUID()
         checkToken = token
         Task {
             let result = await Task.detached { probeExit(tunAddr: c.tunAddr) }.value
             guard token == checkToken, clean(config.tunAddr) == clean(c.tunAddr) else { return }
+            if case .seen = result {
+                Task {
+                    let ai = await Task.detached { probeAIHosts(tunAddr: c.tunAddr) }.value
+                    if token == checkToken { aiSeen = ai }
+                }
+            }
             switch result {
             case .notTun:
                 ipCheck = .failed(L("\(clean(c.tunAddr)) is not a TUN interface right now: turn the TUN app on",
@@ -789,9 +800,24 @@ struct SettingsView: View {
         }
     }
 
+    /// What Claude, the Anthropic API and ChatGPT see: TUN apps can route them
+    /// another way than the probe.
+    @ViewBuilder
+    private var aiSeenRows: some View {
+        ForEach(aiSeen, id: \.host) { s in
+            let ok = !s.ip.isEmpty && config.exitMatches(ip: s.ip, country: s.country)
+            LabeledContent(L("\(s.host) sees", "\(s.host) видит")) {
+                Label(s.ip.isEmpty ? L("no answer", "нет ответа") : "\(s.ip) \(flagEmoji(s.country))",
+                      systemImage: ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(ok ? .green : .orange)
+            }
+        }
+    }
+
     /// Forget what was checked: the config it belonged to is gone.
     private func resetCheck() {
         checkToken = UUID()
+        aiSeen = []
         ipCheck = .idle
         seenIP = nil
         seenCountry = ""
@@ -828,7 +854,9 @@ enum LeakResult {
     case pass, fail, incomplete, baseline, didNotRun
 
     init(output: String) {
-        let result = output.split(separator: "\n").last { $0.hasPrefix("RESULT=") }.map { String($0.dropFirst(7)) }
+        let result = output.split(whereSeparator: { $0.isNewline })
+            .last { $0.hasPrefix("RESULT=") }
+            .map { String($0.dropFirst(7)) }
         switch result {
         case "pass": self = .pass
         case "fail": self = .fail

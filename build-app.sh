@@ -34,13 +34,19 @@ compile x86_64
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/backend/bin" "$APP/Contents/Resources/backend/launchd"
 lipo -create "$TMP/Tunlock-arm64" "$TMP/Tunlock-x86_64" -output "$APP/Contents/MacOS/Tunlock"
+# The guard's sleep helper (IOKit): closes the tunnel before the Mac sleeps.
+for arch in arm64 x86_64; do
+  swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" ${FLAGS[@]+"${FLAGS[@]}"} -framework IOKit \
+    app/Helpers/SleepWatch.swift -o "$TMP/sleepwatch-$arch"
+done
 sed "s/@VERSION@/$VERSION/g" app/Info.plist > "$APP/Contents/Info.plist"
 cp app/Resources/AppIcon.icns "$APP/Contents/Resources/"
 B=$APP/Contents/Resources/backend
 cp bin/tunlock "$B/bin/"
+lipo -create "$TMP/sleepwatch-arm64" "$TMP/sleepwatch-x86_64" -output "$B/bin/tunlock-sleepwatch"
 cp install.sh uninstall.sh tunlock.conf.example "$B/"
 cp launchd/*.plist "$B/launchd/"
-chmod 755 "$B/bin/tunlock" "$B/install.sh" "$B/uninstall.sh"
+chmod 755 "$B/bin/tunlock" "$B/bin/tunlock-sleepwatch" "$B/install.sh" "$B/uninstall.sh"
 codesign --force --deep --sign - "$APP"
 echo "Built $APP"
 echo "Install: cp -R \"$APP\" /Applications/ && open /Applications/Tunlock.app"

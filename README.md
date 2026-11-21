@@ -125,6 +125,13 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
   and offers **Pin…**, but only for when you changed the server yourself.
 - **Notifications** tell you when the internet closes and when protection
   returns. Short blips under four seconds are not reported.
+- **What AI services see.** The exit check and the leak test also ask
+  `claude.ai`, `api.anthropic.com` and `chatgpt.com` which address reached them
+  (a TUN app's rules may route them differently), and the menu warns when the
+  Mac's time zone does not match the exit's country, since sites can read it.
+- **Before sleep** the tunnel closes; after waking it reopens only once the exit
+  is verified again. A Mac that wakes on another Wi-Fi sends nothing through a
+  tunnel that may have reconnected elsewhere.
 
 The build is ad-hoc signed and not notarized. A copy you build yourself opens
 normally. A downloaded copy needs right-click → **Open** the first time.
@@ -332,6 +339,12 @@ sleep, a Wi-Fi change, a utun renumber, reboot and uninstall.
   so SSH can reconnect.
 - **Exit, not identity:** Tunlock controls where traffic leaves. Accounts,
   fingerprints, time zones and telemetry can still identify you.
+
+## Downloads
+
+GitHub Actions builds `Tunlock.dmg` with `SHA256SUMS.txt` (signed with Ed25519
+once the release key is set). See [docs/RELEASES.md](docs/RELEASES.md) to verify a
+download.
 
 ## Uninstall
 

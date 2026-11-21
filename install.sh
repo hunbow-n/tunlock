@@ -42,6 +42,10 @@ root_only_path "$PREFIX/etc"
 
 install -d -o root -g wheel -m 755 "$PREFIX/libexec/tunlock" "$PREFIX/etc" "$PREFIX/bin"
 install -o root -g wheel -m 755 "$SRC/bin/tunlock" "$PREFIX/libexec/tunlock/tunlock"
+# Optional sleep helper (built by build-app.sh): closes the tunnel before sleep.
+if [[ -x $SRC/bin/tunlock-sleepwatch ]]; then
+  install -o root -g wheel -m 755 "$SRC/bin/tunlock-sleepwatch" "$PREFIX/libexec/tunlock/tunlock-sleepwatch"
+fi
 ln -sfn "$PREFIX/libexec/tunlock/tunlock" "$PREFIX/bin/tunlock"
 
 CONF=$PREFIX/etc/tunlock.conf

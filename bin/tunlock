@@ -16,6 +16,8 @@ STATE_DIR=${TUNLOCK_STATE_DIR:-/var/db/tunlock}  # persistent: chosen mode
 RUN_DIR=${TUNLOCK_RUN_DIR:-/var/run/tunlock}     # cleared at boot: live state
 RESOLVER_DIR=${TUNLOCK_RESOLVER_DIR:-/etc/resolver}
 RESOLVER_MARK='# managed by tunlock'
+# Hosts behind Cloudflare whose own /cdn-cgi/trace tells which IP reached them.
+AI_HOSTS=${TUNLOCK_AI_HOSTS:-"claude.ai api.anthropic.com chatgpt.com"}
 # AI clients that keep a session open and would reconnect directly once off.
 AI_APPS=${TUNLOCK_AI_APPS:-"claude Claude codex ChatGPT Cursor"}
 GUARD_LABEL=tunlock.guard
@@ -770,6 +772,14 @@ guard_tick() {
     G_EGRESS_OK=0  # a new interface has to prove its egress again
   fi
   egress_still_valid "$now"
+  # The Mac is about to sleep (tunlock-sleepwatch asks): close the tunnel now,
+  # and keep it closed until a fresh exit check after wake.
+  local sleeping=0
+  if [[ -e $RUN_DIR/sleep-request ]]; then
+    sleeping=1
+    if [[ $G_EGRESS_OK == 1 ]]; then log "Mac going to sleep: tunnel closed until the exit is verified after wake"; fi
+    G_EGRESS_OK=0
+  fi
   local rules_ok=1
   guard_sync_rules || rules_ok=0
 
@@ -792,8 +802,10 @@ guard_tick() {
     fi
   fi
   [[ $G_ARMED == 1 ]] || G_ERROR=${G_ERROR:-"existing connections not reset yet"}
+  # Tell the sleep helper the tunnel is closed, so the Mac may sleep.
+  if (( sleeping )) && [[ $rules_ok == 1 && ! -e $RUN_DIR/sleep-ack ]]; then touch "$RUN_DIR/sleep-ack"; fi
 
-  if [[ -n $G_TUN && $rules_ok == 1 && $G_ARMED == 1 ]]; then
+  if [[ -n $G_TUN && $rules_ok == 1 && $G_ARMED == 1 && $sleeping == 0 ]]; then
     local interval=$PROBE_INTERVAL
     [[ $G_EGRESS_OK == 1 ]] || interval=3
     if (( now - G_PROBE_AT >= interval )); then
@@ -846,12 +858,23 @@ guard_init() {
   fi
 }
 
+# Starts tunlock-sleepwatch next to the guard when it is installed.
+start_sleepwatch() {
+  local helper
+  helper="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/tunlock-sleepwatch"
+  [[ -x $helper ]] || return 0
+  if [[ -s $RUN_DIR/sleepwatch.pid ]]; then kill "$(cat "$RUN_DIR/sleepwatch.pid")" 2>/dev/null || true; fi
+  "$helper" "$RUN_DIR" &
+  echo $! > "$RUN_DIR/sleepwatch.pid"
+}
+
 cmd_guard() {
   require_root
   load_config
   guard_init
+  start_sleepwatch
   # Stopping the guard leaves the rules in place on purpose: fail closed.
-  trap 'log "guard stopped"; exit 0' TERM INT
+  trap 'log "guard stopped"; [[ -s $RUN_DIR/sleepwatch.pid ]] && kill "$(cat "$RUN_DIR/sleepwatch.pid")" 2>/dev/null; exit 0' TERM INT
   log "guard $VERSION started, mode $(read_mode)"
   while :; do
     guard_tick
@@ -1232,6 +1255,45 @@ cmd_test() {
   read -r ip loc <<< "$(trace -4 https://www.cloudflare.com/cdn-cgi/trace || true)"
   egress_matches "$ip" "$loc" && r=ok || r=fail
   check "HTTPS by name, system DNS and route" ok "$r" "${ip:-no answer}${loc:+ $loc}"
+
+  # What AI services themselves see. A TUN app's routing rules may send these
+  # hosts through another outbound than the probe. They sit behind Cloudflare,
+  # so their own /cdn-cgi/trace says which address reached them.
+  local host
+  for host in $AI_HOSTS; do
+    read -r ip loc <<< "$(trace -4 "https://$host/cdn-cgi/trace" || true)"
+    if [[ -z $ip ]]; then
+      line SKIP "$host sees" "no answer"
+      skipped=$((skipped + 1))
+    else
+      egress_matches "$ip" "$loc" && r=ok || r=fail
+      check "$host sees" ok "$r" "$ip${loc:+ $loc}"
+    fi
+  done
+
+  # Which resolver answers the system's DNS. A fake-IP TUN app answers with
+  # its own addresses (any range) and resolves inside the tunnel: a known name
+  # with known addresses tells the two apart.
+  local dns known
+  known=$(dig +short +time=3 +tries=1 one.one.one.one A 2>/dev/null | head -1)
+  dns=$(dig +short +time=3 +tries=1 whoami.akamai.net 2>/dev/null | head -1)
+  if [[ -n $known && $known != 1.1.1.1 && $known != 1.0.0.1 ]]; then
+    line INFO "DNS" "the TUN app answers DNS itself (fake-IP, e.g. $known): names resolve inside the tunnel"
+  elif [[ -n $dns ]]; then
+    line INFO "DNS resolver seen by Akamai" "$dns"
+  else
+    line INFO "DNS resolver" "no answer"
+  fi
+
+  # Sites can read the browser's time zone. Far from the exit's country, it stands out.
+  local tz tzcc
+  tz=$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')
+  tzcc=$(awk -v z="$tz" '!/^#/ && $3 == z { print $1; exit }' /usr/share/zoneinfo/zone.tab 2>/dev/null)
+  if [[ -n $tzcc && -n $loc && $tzcc != "$loc" ]]; then
+    line INFO "time zone" "$tz ($tzcc) differs from the exit country $loc: sites can see this"
+  elif [[ -n $tz ]]; then
+    line INFO "time zone" "$tz${tzcc:+ ($tzcc)}"
+  fi
 
   if [[ -z $phys ]]; then
     skip "direct IPv4 / UDP / IPv6" "no Wi-Fi or Ethernet connection" 1

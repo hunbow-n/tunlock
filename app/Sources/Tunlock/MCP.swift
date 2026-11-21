@@ -92,7 +92,7 @@ enum MCPServer {
          "description": "Check that a proxy answers on IP:port (TCP). Only IP and port: never ask for or pass the proxy's login or password.",
          "inputSchema": schema(["host": str, "port": str], required: ["host", "port"])],
         ["name": "check_exit",
-         "description": "Ask 1.1.1.1 through a TUN interface's address which exit IP and country the traffic has.",
+         "description": "Through a current TUN interface only: the exit IP and country (1.1.1.1), what claude.ai, api.anthropic.com and chatgpt.com see, and the Mac's time zone (sites can read it; one far from the exit's country stands out).",
          "inputSchema": schema(["tun_addr": str], required: ["tun_addr"])],
         ["name": "validate_config",
          "description": "Validate a complete tunlock.conf (KEY=value lines) with the same parser the root guard uses. Returns the errors, or the effective settings and the firewall rules each phase would load. Changes nothing.",
@@ -193,7 +193,10 @@ enum MCPServer {
         case .noAnswer:
             return ("No answer through \(tunAddr): is the TUN app on and connected?", true)
         case .seen(let ip, let country):
-            return (json(["exit_ip": ip, "exit_country": country]), false)
+            let ai = probeAIHosts(tunAddr: tunAddr).map { ["host": $0.host, "ip": $0.ip, "country": $0.country] }
+            let tz = macTimeZone()
+            return (json(["exit_ip": ip, "exit_country": country, "seen_by_ai_services": ai,
+                          "mac_time_zone": tz.zone, "mac_time_zone_country": tz.country]), false)
         }
     }
 

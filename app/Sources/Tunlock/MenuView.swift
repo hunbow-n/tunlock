@@ -290,6 +290,21 @@ struct MenuView: View {
                     Text(L("Firewall: ", "Файрвол: ") + firewall(s))
                 }
             }
+            if v == .protected, let cc = s["egress_country"], cc.count == 2 {
+                let tz = macTimeZone()
+                if !tz.country.isEmpty, tz.country != cc {
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
+                        Text(L("Mac time zone \(tz.zone) (\(flagEmoji(tz.country))) ≠ exit \(flagEmoji(cc)): sites can see it.",
+                               "Часовой пояс Mac \(tz.zone) (\(flagEmoji(tz.country))) ≠ выход \(flagEmoji(cc)): сайты это видят."))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(L("Change…", "Изменить…")) {
+                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Date-Time-Settings.extension")!)
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+            }
             if let bypass = s["bypass"], !bypass.isEmpty {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.uturn.right").foregroundStyle(.secondary)

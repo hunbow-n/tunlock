@@ -27,7 +27,7 @@ bad_conf() { # name, line to append or replace
 }
 
 if command -v shellcheck >/dev/null; then
-  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh 2>&1); then
+  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh tools/release-key.sh 2>&1); then
     ok shellcheck; else ko shellcheck "$out"; fi
 else echo "skip shellcheck (not installed)"; fi
 
@@ -241,6 +241,14 @@ expect_eq "conflict: quick on com.apple/* makes an earlier sibling decide" "$(ve
 
 guard_setup; printf 'scrub-anchor "com.apple/*" all fragment reassemble\nanchor "com.apple/*" all\n' > "$STUB/root_rules"; gt 2
 expect_eq "conflict: stock macOS layout has none" "$(verdict) | $(st pf_conflict)" "protected | "
+rm -rf "$STUB"
+
+# Before sleep: the tunnel closes and the helper is told; no reopening until wake
+guard_setup; printf '#!/bin/bash\n[[ $1 == 0 ]] && touch "$STUB/run/sleep-request"\nexit 0\n' > "$hook"; chmod +x "$hook"; gt 3 "$hook"
+expect_eq "sleep: the tunnel closes before the Mac sleeps and the helper is told" \
+  "$(st phase) $(st egress_ok) $([[ -e $STUB/run/sleep-ack ]] && echo ack)" "probe 0 ack"
+rm -f "$STUB/run/sleep-request" "$STUB/run/sleep-ack"; gt 2
+expect_eq "sleep: after wake it reopens only after a fresh check" "$(st phase) $(st egress_ok)" "open 1"
 rm -rf "$STUB"
 
 guard_setup; echo "req-42" > "$STUB/db/request"; gt 1

@@ -65,6 +65,8 @@ logt() { date -r $(( t0 + $1 )) '+%Y-%m-%d %H:%M:%S'; }
 export TUNLOCK_UI_LOG=$TMP/guard.log
 export TUNLOCK_UI_EXE=/Applications/Tunlock.app/Contents/MacOS/Tunlock
 export TUNLOCK_UI_DRAFT=$TMP/draft.conf
+# A neutral zone for public screenshots (shows the time zone hint next to an NL exit).
+export TZ=America/New_York
 # The exit changed: the menu offers to pin it.
 sed -e 's/^egress_ok=1$/egress_ok=0/' -e 's/^egress_ip=.*/egress_ip=192.0.2.44/' -e 's/^egress_country=.*/egress_country=DE/' \
   -e 's/^phase=open$/phase=probe/' "$TMP/state" > "$TMP/state-foreign"

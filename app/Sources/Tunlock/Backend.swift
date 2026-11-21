@@ -362,14 +362,32 @@ enum ExitProbe: Equatable {
 
 func probeExit(tunAddr: String) -> ExitProbe {
     guard let tun = tunInterfaces().first(where: { $0.address == clean(tunAddr) }) else { return .notTun }
+    let r = cloudflareTrace("https://1.1.1.1/cdn-cgi/trace", interface: tun.name)
+    return r.ip.isEmpty ? .noAnswer : .seen(ip: r.ip, country: r.country)
+}
+
+/// AI services behind Cloudflare: what address each of them sees through the
+/// TUN interface. A TUN app's routing rules may send them another way than the probe.
+let aiHosts = ["claude.ai", "api.anthropic.com", "chatgpt.com"]
+
+func probeAIHosts(tunAddr: String) -> [(host: String, ip: String, country: String)] {
+    guard let tun = tunInterfaces().first(where: { $0.address == clean(tunAddr) }) else { return [] }
+    return aiHosts.map { host in
+        let r = cloudflareTrace("https://\(host)/cdn-cgi/trace", interface: tun.name)
+        return (host, r.ip, r.country)
+    }
+}
+
+/// One /cdn-cgi/trace request bound to an interface by name.
+func cloudflareTrace(_ url: String, interface: String) -> (ip: String, country: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-    p.arguments = ["-4fsS", "--noproxy", "*", "--interface", "if!\(tun.name)",
-                   "--connect-timeout", "4", "--max-time", "6", "https://1.1.1.1/cdn-cgi/trace"]
+    p.arguments = ["-4fsS", "--noproxy", "*", "--interface", "if!\(interface)",
+                   "--connect-timeout", "4", "--max-time", "6", url]
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = FileHandle.nullDevice
-    guard (try? p.run()) != nil else { return .noAnswer }
+    guard (try? p.run()) != nil else { return ("", "") }
     let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
     p.waitUntilExit()
     var ip = "", cc = ""
@@ -377,5 +395,17 @@ func probeExit(tunAddr: String) -> ExitProbe {
         if line.hasPrefix("ip=") { ip = String(line.dropFirst(3)) }
         if line.hasPrefix("loc=") { cc = String(line.dropFirst(4)) }
     }
-    return ip.isEmpty ? .noAnswer : .seen(ip: ip, country: cc)
+    return (ip, cc)
+}
+
+/// The Mac's time zone and its country (from the system's zone.tab). Sites can
+/// read the browser's time zone; one far from the exit's country stands out.
+func macTimeZone() -> (zone: String, country: String) {
+    let zone = TimeZone.current.identifier
+    guard let tab = try? String(contentsOfFile: "/usr/share/zoneinfo/zone.tab", encoding: .utf8) else { return (zone, "") }
+    for line in tab.split(separator: "\n") where !line.hasPrefix("#") {
+        let f = line.split(separator: "\t")
+        if f.count >= 3, f[2] == zone { return (zone, String(f[0])) }
+    }
+    return (zone, "")
 }
