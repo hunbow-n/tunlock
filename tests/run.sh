@@ -251,6 +251,50 @@ rm -f "$STUB/run/sleep-request" "$STUB/run/sleep-ack"; gt 2
 expect_eq "sleep: after wake it reopens only after a fresh check" "$(st phase) $(st egress_ok)" "open 1"
 rm -rf "$STUB"
 
+# Block reasons: one code from the guard, the same order as the verdict
+reason() { TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status --porcelain | awk -F= '$1 == "reason" { print $2 }'; }
+human() { TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status 2>&1 || true; }
+reason_case() { # label, expected "verdict reason egress_check", setup commands (eval'd), ticks
+  guard_setup; eval "$3"; gt "${4:-2}"
+  expect_eq "reason: $1" "$(verdict) $(reason) $(st egress_check)" "$2"
+  expect_eq "reason: $1 (porcelain has one reason line)" "$(TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status --porcelain | grep -c '^reason=')" "1"
+}
+reason_case "verified exit" "protected ok ok" ":"; rm -rf "$STUB"
+reason_case "no TUN interface" "blocked no_tun pending" "sed -i '' 's/^utun7:/utunX:/' \"\$STUB/ifconfig.txt\""
+grep -q 'no TUN interface; turn on your TUN app' <<< "$(human)" && ok "reason: status says what to do without TUN" \
+  || ko "reason: status says what to do without TUN" "$(human)"; rm -rf "$STUB"
+reason_case "SSH forward down" "blocked ssh_down pending" "rm -f \"\$STUB/ssh_up\""; rm -rf "$STUB"
+reason_case "unexpected exit" "blocked exit_mismatch mismatch" "echo 198.51.100.9 > \"\$STUB/egress\""
+grep -q 'Egress   198.51.100.9 (NOT expected' <<< "$(human)" && ok "reason: an unexpected exit is shown as such" \
+  || ko "reason: an unexpected exit is shown as such" "$(human)"; rm -rf "$STUB"
+reason_case "exit check without an answer" "blocked exit_no_answer no_answer" "rm -f \"\$STUB/egress\""
+grep -q 'Egress   no answer through the tunnel' <<< "$(human)" && ok "reason: no answer is not called a wrong exit" \
+  || ko "reason: no answer is not called a wrong exit" "$(human)"; rm -rf "$STUB"
+reason_case "rejected pf load" "unprotected pf_error pending" ": > \"\$STUB/pf_fail\""; rm -rf "$STUB"
+reason_case "pf conflict" "unprotected pf_conflict ok" "printf 'pass out quick all\nanchor \"com.apple/*\" all\n' > \"\$STUB/root_rules\""; rm -rf "$STUB"
+reason_case "direct mode" "direct off pending" "echo direct > \"\$STUB/db/mode\""
+human | grep -q '^Reason' && ko "reason: direct mode has no Reason line" "$(human)" || ok "reason: direct mode has no Reason line"; rm -rf "$STUB"
+guard_setup; printf '#!/bin/bash\n[[ $1 == 0 ]] && touch "$STUB/run/sleep-request"\nexit 0\n' > "$hook"; chmod +x "$hook"; gt 3 "$hook"
+expect_eq "reason: going to sleep" "$(verdict) $(reason)" "blocked sleep"; rm -rf "$STUB"
+# Proxy: the TCP port check and the exit check are separate results
+reason_case "proxy port open, exit not ours" "blocked exit_mismatch mismatch" \
+  "printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nEXPECTED_EGRESS=203.0.113.10\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\n' > \"\$STUB/conf\"; echo 198.51.100.9 > \"\$STUB/egress\""
+out=$(human)
+grep -q '^Proxy    TCP port open  198.51.100.20:8080' <<< "$out" && grep -q '^Reason   exit_mismatch' <<< "$out" \
+  && ok "reason: an open proxy port and an unverified exit are both shown" || ko "reason: an open proxy port and an unverified exit are both shown" "$out"
+rm -rf "$STUB"
+reason_case "proxy port closed" "blocked entry_down no_answer" \
+  "printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\n' > \"\$STUB/conf\"; touch \"\$STUB/entry_down\"; rm -f \"\$STUB/egress\""
+grep -q '^Proxy    TCP port closed' <<< "$(human)" && ok "reason: a closed proxy port is shown" || ko "reason: a closed proxy port is shown" "$(human)"
+rm -rf "$STUB"
+# Old or missing state: say so, never repeat the old reason
+guard_setup; gt 2; sed -i '' "s/^updated=.*/updated=$(( $(date +%s) - 60 ))/" "$STUB/run/state"
+expect_eq "reason: stale state is stale, not the old reason" "$(verdict) $(reason)" "unknown stale"; rm -rf "$STUB"
+guard_setup
+expect_eq "reason: no state at all" "$(reason)" "no_state"; rm -rf "$STUB"
+guard_setup; gt 2; sed -i '' '/^reason=/d' "$STUB/run/state"
+expect_eq "reason: a guard that writes no reason gives unknown, not a guess" "$(reason)" "unknown"; rm -rf "$STUB"
+
 guard_setup; echo "req-42" > "$STUB/db/request"; gt 1
 expect_eq "guard: echoes the request id it has applied" "$(st ack) $(st mode)" "req-42 protected"
 rm -rf "$STUB"

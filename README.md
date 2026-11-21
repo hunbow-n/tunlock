@@ -288,13 +288,19 @@ Everything the app does is also a command:
 tunlock on            # firewall first, then SSH and the TUN app
 tunlock off           # nothing blocked, SSH port freed, TUN app stopped; asks first while Claude Code, Codex, ChatGPT run
 tunlock ai-clients    # AI apps still running that would reconnect directly once off
-tunlock status        # SSH, verified exit IP, pf state  (--porcelain for scripts)
+tunlock status        # SSH, verified exit IP, pf state, why it is blocked  (--porcelain for scripts)
 sudo tunlock test     # live leak test: PASS / FAIL / SKIP per check
 tunlock doctor        # check the installation
 ```
 
 `on` succeeds only when the guard confirms protection for this very request.
 `status` exits 0 for a confirmed state, 1 for not protected, 3 for unknown.
+When the internet is blocked or not protected, `Reason` names the first cause
+and what to do: no TUN interface, the entry's TCP port closed, SSH down, an
+unexpected exit, no answer from the exit, or a pf problem. For a proxy, an open
+TCP port only means the port answers; the exit is checked separately. An old
+state shows `stale` instead of the last reason. `--porcelain` prints the code
+as `reason=`, and the app and MCP use the same codes.
 Logs: `/var/log/tunlock.log` (guard) and `~/Library/Logs/tunlock-ssh.log`.
 
 Without the app: `sudo ./install.sh` (the first run creates the config), edit

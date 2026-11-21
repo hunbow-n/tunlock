@@ -47,7 +47,7 @@ evaluated earlier would decide first and hide what tunlock does.
 4. **Server unreachable.** Block the server from another device, or stop sshd
    on it. Direct paths must fail.
 5. **TUN client disconnected**, then **quit** (Cmd+Q). Run `tunlock status`; it
-   must show `BLOCKED`. Direct paths must fail.
+   must show `BLOCKED` with `Reason no_tun`. Direct paths must fail.
 6. **Reconnect.** Start the TUN client again, ideally until it gets a different
    utun number. Within a few seconds, status returns to `PROTECTED` with the new
    utun. While it reconnects, `while :; do curl -4s --interface en0

@@ -612,6 +612,7 @@ write_state() {
     echo "egress_ok=$G_EGRESS_OK"
     echo "egress_at=$G_EGRESS_AT"
     echo "egress_country=$G_EGRESS_COUNTRY"
+    echo "egress_check=$G_EGRESS_CHECK"
     echo "phys=$G_PHYS"
     echo "expected=$EXPECTED_EGRESS"
     echo "expected_country=$EXPECTED_COUNTRY"
@@ -623,9 +624,44 @@ write_state() {
     echo "pf_conflict=$G_CONFLICT"
     echo "warning=$G_WARNING"
     echo "bypass=${BYPASS_LIST[*]-}"
+    echo "reason=$(guard_reason)"
   } > "$tmp"
   chmod 644 "$tmp"
   mv -f "$tmp" "$RUN_DIR/state"
+}
+
+# Why the internet is open, closed or unprotected right now, one code from
+# the guard's own view. It follows the same order as compute_verdict, so the
+# reason never contradicts the verdict. Readers replace it with "stale" when
+# the state is old.
+#   ok                    protected: the exit is verified
+#   off / release_failed  direct mode, rules removed or not
+#   pf_conflict pf_error pf_disabled pf_unreachable pf_no_rules
+#                         unprotected: tunlock's rules are not (alone) in force
+#   sleep no_tun entry_down ssh_down exit_mismatch exit_no_answer exit_pending
+#                         blocked: nothing leaves, and this is the first cause
+#   unknown               none of the above: no guess
+guard_reason() {
+  if [[ $G_MODE == direct ]]; then
+    [[ -z $G_ERROR ]] && echo off || echo release_failed
+  elif [[ -n $G_CONFLICT ]]; then echo pf_conflict
+  elif [[ -n $G_ERROR ]]; then echo pf_error
+  elif [[ $G_PF_ENABLED != 1 ]]; then echo pf_disabled
+  elif [[ $G_PF_REACHABLE != 1 ]]; then echo pf_unreachable
+  elif (( ${G_PF_RULES:-0} <= 0 )); then echo pf_no_rules
+  elif [[ $G_PHASE == open ]]; then echo ok
+  elif [[ $G_PHASE != block && $G_PHASE != probe ]]; then echo unknown
+  elif [[ ${G_SLEEPING:-0} == 1 ]]; then echo sleep
+  elif [[ -z $G_TUN ]]; then echo no_tun
+  elif [[ ($UPSTREAM == proxy || -n $JUMP_HOST) && $G_ENTRY == down ]]; then echo entry_down
+  elif [[ $UPSTREAM != proxy && $G_SSH == down ]]; then echo ssh_down
+  else
+    case $G_EGRESS_CHECK in
+      mismatch) echo exit_mismatch ;;
+      no_answer) echo exit_no_answer ;;
+      *) echo exit_pending ;;
+    esac
+  fi
 }
 
 guard_sync_rules() {
@@ -710,7 +746,7 @@ egress_still_valid() {
   else
     return 0
   fi
-  G_EGRESS_OK=0
+  G_EGRESS_OK=0 G_EGRESS_CHECK=pending
 }
 
 guard_tick() {
@@ -723,7 +759,7 @@ guard_tick() {
   # reconnected elsewhere under the same utun, so verify egress again.
   if (( G_LAST_TICK > 0 && now - G_LAST_TICK > 10 )) && [[ $G_EGRESS_OK == 1 ]]; then
     log "woke after $((now - G_LAST_TICK))s: re-verifying egress"
-    G_EGRESS_OK=0
+    G_EGRESS_OK=0 G_EGRESS_CHECK=pending
   fi
   G_LAST_TICK=$now
   G_MODE=$(read_mode)
@@ -752,7 +788,7 @@ guard_tick() {
       fi
     fi
     rm -f "$RUN_DIR/armed"
-    G_APPLIED='' G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_ARMED=0
+    G_APPLIED='' G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0
     G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT=''
     if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
     return
@@ -769,16 +805,17 @@ guard_tick() {
   if [[ $tun != "$G_TUN" ]]; then
     [[ -n $tun ]] && log "tun: ${G_TUN:-none} -> $tun" || log "tun: $G_TUN gone"
     G_TUN=$tun
-    G_EGRESS_OK=0  # a new interface has to prove its egress again
+    G_EGRESS_OK=0 G_EGRESS_CHECK=pending  # a new interface has to prove its egress again
   fi
   egress_still_valid "$now"
   # The Mac is about to sleep (tunlock-sleepwatch asks): close the tunnel now,
   # and keep it closed until a fresh exit check after wake.
   local sleeping=0
+  G_SLEEPING=0
   if [[ -e $RUN_DIR/sleep-request ]]; then
-    sleeping=1
+    sleeping=1 G_SLEEPING=1
     if [[ $G_EGRESS_OK == 1 ]]; then log "Mac going to sleep: tunnel closed until the exit is verified after wake"; fi
-    G_EGRESS_OK=0
+    G_EGRESS_OK=0 G_EGRESS_CHECK=pending
   fi
   local rules_ok=1
   guard_sync_rules || rules_ok=0
@@ -816,13 +853,13 @@ guard_tick() {
       [[ -z $ip ]] || G_EGRESS_COUNTRY=$loc
       if egress_matches "$ip" "$loc"; then
         [[ $G_EGRESS_OK == 1 && $ip == "$G_EGRESS_IP" ]] || log "egress verified: $ip${loc:+ ($loc)} via $G_TUN"
-        G_EGRESS_OK=1 G_EGRESS_IP=$ip G_EGRESS_AT=$now
+        G_EGRESS_OK=1 G_EGRESS_IP=$ip G_EGRESS_AT=$now G_EGRESS_CHECK=ok
       elif [[ -n $ip ]]; then
         log "egress MISMATCH: got $ip${loc:+ ($loc)}, expected $(expected_desc); tunnel closed"
-        G_EGRESS_OK=0 G_EGRESS_IP=$ip G_EGRESS_AT=$now
-      elif [[ $G_EGRESS_OK == 1 ]]; then
-        log "egress check got no answer: tunnel closed until verified"
-        G_EGRESS_OK=0
+        G_EGRESS_OK=0 G_EGRESS_IP=$ip G_EGRESS_AT=$now G_EGRESS_CHECK=mismatch
+      else
+        if [[ $G_EGRESS_OK == 1 ]]; then log "egress check got no answer: tunnel closed until verified"; fi
+        G_EGRESS_OK=0 G_EGRESS_CHECK=no_answer
       fi
       guard_sync_rules || true
     fi
@@ -845,9 +882,9 @@ policy_fingerprint() {
 guard_init() {
   mkdir -p "$STATE_DIR" "$RUN_DIR"
   chmod 755 "$STATE_DIR" "$RUN_DIR"
-  G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0
+  G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0 G_EGRESS_CHECK=pending
   G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
-  G_ENTRY=unknown G_ENTRY_AT=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
+  G_ENTRY=unknown G_ENTRY_AT=0 G_SLEEPING=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0
   # ...unless what may pass outside the tunnel changed (another proxy or
@@ -1148,6 +1185,49 @@ stop_keeper_and_service() {
   if [[ -n $TUN_SERVICE ]]; then as_console_user scutil --nc stop "$TUN_SERVICE" >/dev/null 2>&1 || true; fi
 }
 
+# The guard's reason, unless its state is too old to say anything.
+compute_reason() {
+  [[ -r $RUN_DIR/state ]] || { echo no_state; return; }
+  local r u
+  u=$(state_get updated)
+  if (( $(date +%s) - ${u:-0} > 10 )); then echo stale; return; fi
+  r=$(state_get reason)
+  echo "${r:-unknown}"
+}
+
+# One line per reason: what happened, then what to do.
+reason_text() {
+  case $1 in
+    ok) echo "exit verified" ;;
+    off) echo "tunlock is off" ;;
+    release_failed) echo "rules could not be removed; run: sudo tunlock off" ;;
+    pf_conflict) echo "other pf rules decide before tunlock; see Conflict, then tunlock doctor" ;;
+    pf_error) echo "pf problem (see Error); run: tunlock doctor" ;;
+    pf_disabled) echo "pf is disabled; the guard retries, run: tunlock doctor" ;;
+    pf_unreachable) echo "the root pf ruleset does not reach tunlock's anchor; run: tunlock doctor" ;;
+    pf_no_rules) echo "tunlock's anchor holds no rules; run: tunlock doctor" ;;
+    sleep) echo "the Mac is going to sleep; the exit is checked again after wake" ;;
+    no_tun) echo "no TUN interface; turn on your TUN app in TUN mode" ;;
+    entry_down) echo "the TCP port of the entry ($(state_get entry)) does not answer; check the proxy or server" ;;
+    ssh_down) echo "SSH forward is down; waiting for it to reconnect (tunlock logs)" ;;
+    exit_mismatch) echo "the exit answered from $(state_get egress_ip), not the expected one; pin it in the app only if you changed it" ;;
+    exit_no_answer) echo "the exit check through the tunnel got no answer; check the TUN app's connection" ;;
+    exit_pending) echo "checking the exit through the tunnel" ;;
+    stale) echo "the guard's state is old; is the guard running? (tunlock doctor)" ;;
+    no_state) echo "no state from the guard; run install.sh" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# The entry check only opens a TCP connection: it says nothing about the exit.
+entry_desc() {
+  case $(state_get entry_up) in
+    up) echo "TCP port open" ;;
+    down) echo "TCP port closed" ;;
+    *) echo "TCP port not checked yet" ;;
+  esac
+}
+
 age() { local s=$1; (( s < 120 )) && echo "${s}s" || echo "$((s / 60))m"; }
 
 cmd_status() {
@@ -1155,7 +1235,7 @@ cmd_status() {
   [[ ${1:-} == --porcelain ]] && porcelain=1
   load_config >/dev/null
   if [[ ! -r $RUN_DIR/state ]]; then
-    (( porcelain )) && { echo "verdict=unknown"; return 3; }
+    (( porcelain )) && { echo "verdict=unknown"; echo "reason=no_state"; return 3; }
     echo "No state from the guard. Is it installed and running? (tunlock doctor)"
     return 3
   fi
@@ -1169,20 +1249,29 @@ cmd_status() {
   verdict=$(compute_verdict)
 
   if (( porcelain )); then
-    cat "$RUN_DIR/state"
+    grep -v '^reason=' "$RUN_DIR/state" || true
     echo "stale=$stale"
     echo "verdict=$verdict"
+    echo "reason=$(compute_reason)"
     status_code "$verdict"
     return
   fi
   local e_line="none"
-  [[ -n $eip ]] && e_line="$eip ($( [[ $eok == 1 ]] && echo verified || echo NOT expected ), $(age $((now - eat))) ago)"
+  local echeck
+  echeck=$(state_get egress_check)
+  if [[ $eok == 1 ]]; then e_line="$eip (verified, $(age $((now - eat))) ago)"
+  elif [[ $echeck == mismatch ]]; then e_line="$eip (NOT expected, $(age $((now - eat))) ago)"
+  elif [[ $echeck == no_answer ]]; then e_line="no answer through the tunnel"
+  elif [[ $echeck == pending ]]; then e_line="not verified yet"
+  # A guard without egress_check: say only what the state proves.
+  elif [[ -n $eip ]]; then e_line="$eip (not verified, $(age $((now - eat))) ago)"
+  fi
   printf '%-8s %s\n' Mode "$mode"
   if [[ $(state_get upstream) == proxy ]]; then
-    printf '%-8s %s\n' Proxy "$(state_get entry_up)  $(state_get entry)"
+    printf '%-8s %s\n' Proxy "$(entry_desc)  $(state_get entry)"
   else
     if [[ $(state_get cascade) == 1 ]]; then
-      printf '%-8s %s\n' Entry "$(state_get entry_up)  $(state_get entry) (cascade)"
+      printf '%-8s %s\n' Entry "$(entry_desc)  $(state_get entry) (cascade)"
     fi
     printf '%-8s %s\n' SSH "$ssh  $(state_get ssh_endpoint)"
   fi
@@ -1192,6 +1281,9 @@ cmd_status() {
   printf '%-8s %s\n' Egress "$e_line  expected $exp${ec:+ in $ec}${tun:+  via $tun}"
   printf '%-8s %s\n' PF "phase $phase, pf $( [[ $pfe == 1 ]] && echo enabled || echo disabled ), $pfr rules in $(state_get pf_anchor)"
   [[ -z $(state_get bypass) ]] || printf '%-8s %s\n' Direct "$(state_get bypass) (around the tunnel)"
+  local reason
+  reason=$(compute_reason)
+  [[ $reason == ok || $reason == off ]] || printf '%-8s %s\n' Reason "$reason: $(reason_text "$reason")"
   [[ -z $err ]] || printf '%-8s %s\n' Error "$err"
   [[ -z $(state_get pf_conflict) ]] || printf '%-8s %s\n' Conflict "$(state_get pf_conflict)"
   [[ -z $(state_get warning) ]] || printf '%-8s %s\n' Warning "$(state_get warning)"
