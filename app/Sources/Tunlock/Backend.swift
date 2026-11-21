@@ -409,3 +409,24 @@ func macTimeZone() -> (zone: String, country: String) {
     }
     return (zone, "")
 }
+
+/// One parse of `tunlock test` output, for the header and the lines alike.
+/// Run through AppleScript, the output comes with CR line breaks.
+struct LeakOutput {
+    /// The lines to show, without RESULT=, SKIPPED= and UNCONFIRMED=.
+    let lines: [String]
+    /// The RESULT= value: pass, fail, incomplete or baseline.
+    let result: String?
+    /// What the run could not prove blocked: ipv4, udp, ipv6.
+    let unconfirmed: [String]
+
+    init(_ output: String) {
+        let all = output.split(whereSeparator: { $0.isNewline }).map(String.init)
+        func value(_ key: String) -> String? {
+            all.last { $0.hasPrefix(key + "=") }.map { String($0.dropFirst(key.count + 1)) }
+        }
+        result = value("RESULT")
+        unconfirmed = (value("UNCONFIRMED") ?? "").split(separator: " ").map(String.init)
+        lines = all.filter { !$0.hasPrefix("RESULT=") && !$0.hasPrefix("SKIPPED=") && !$0.hasPrefix("UNCONFIRMED=") }
+    }
+}

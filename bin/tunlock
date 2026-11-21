@@ -1209,14 +1209,57 @@ cmd_status() {
 # 0 for a confirmed state (protected, blocked, direct), 1 unprotected, 3 unknown.
 status_code() { case $1 in unprotected | error) return 1 ;; unknown) return 3 ;; *) return 0 ;; esac; }
 
+# IPv6 reference runs, one line per network: "iface router reach(1|0) epoch".
+# A protected run counts "no IPv6 answer" as blocked only where a direct run
+# saw the same target answer: without that, the network may lack IPv6.
+# One IPv6 network as a single token: interface, router, the router's
+# link-layer address and the interface's /64 prefix. Routers often share
+# fe80::1, so the router address alone does not tell two networks apart.
+# Empty when the network cannot be told apart: no reference then.
+ipv6_network() { # phys
+  local gw mac prefix
+  gw=$(route -n get -inet6 default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }')
+  [[ -n $gw ]] || return 0
+  mac=$(ndp -n "$gw" 2>/dev/null | awk 'NR > 1 && $2 ~ /^[0-9a-f]{1,2}(:[0-9a-f]{1,2}){5}$/ { print $2; exit }')
+  prefix=$(ifconfig "$1" 2>/dev/null | awk '$1 == "inet6" && $2 !~ /^fe80/ && $2 !~ /^f[cd]/ {
+      a = $2; sub(/%.*/, "", a); n = split(a, h, ":"); out = ""; k = 0
+      for (i = 1; i <= n && k < 4; i++) {
+        if (h[i] == "") { if (i > 1 && i < n) for (z = 0; z < 9 - n && k < 4; z++) { out = out (k ? ":" : "") "0"; k++ } ; continue }
+        out = out (k ? ":" : "") h[i]; k++
+      }
+      while (k < 4) { out = out ":0"; k++ }
+      print out; exit }')
+  [[ -n $mac && -n $prefix ]] || return 0
+  echo "$1|$gw|$mac|$prefix"
+}
+IPV6_BASELINE_TTL=86400  # a reference older than a day proves nothing
+ipv6_baseline() { # network: 1, 0 or nothing
+  [[ -n $1 ]] || return 0
+  awk -v k="$1" -v now="$(date +%s)" -v ttl="$IPV6_BASELINE_TTL" \
+    '$1 == k && now - $3 >= 0 && now - $3 <= ttl { r = $2 } END { if (r != "") print r }' \
+    "$STATE_DIR/ipv6-baseline" 2>/dev/null || true
+}
+ipv6_baseline_save() { # network reach
+  [[ -n $1 ]] || return 0
+  local f=$STATE_DIR/ipv6-baseline tmp
+  (umask 022; mkdir -p "$STATE_DIR")
+  tmp=$(mktemp "$STATE_DIR/.ipv6-baseline.XXXXXX")
+  { awk -v k="$1" '$1 != k && NF == 3' "$f" 2>/dev/null || true; echo "$1 $2 $(date +%s)"; } | tail -n 20 > "$tmp"
+  chmod 644 "$tmp"; mv -f "$tmp" "$f"
+}
+
 # Live leak test. Every line is PASS (behaved as required), FAIL (leak or
-# broken tunnel), SKIP (could not be checked here) or INFO (direct mode:
-# reference only). The last line is RESULT=pass|fail|incomplete|baseline.
-# A required check that could not run makes the result incomplete, never pass.
+# broken tunnel), SKIP (could not be checked here, with the reason) or INFO
+# (direct mode: reference only). "No answer" proves blocking only when the
+# target is known to answer: through the tunnel, or for IPv6 in a direct
+# reference run on the same network. Otherwise the check is a SKIP.
+# Protected runs end with UNCONFIRMED=<ipv4 udp ipv6, what this run could not
+# prove blocked> and RESULT=pass|fail|incomplete; direct runs with
+# RESULT=baseline. A required check that could not run gives incomplete.
 cmd_test() {
   require_root
   load_config
-  local phys mode ip r fails=0 missing=0 skipped=0 has6=0
+  local phys mode ip r fails=0 missing=0 skipped=0 has6=0 unconfirmed=
   phys=$(physical_iface)
   mode=$(read_mode)
   echo "Mode: $mode, physical interface: ${phys:-none}, expected egress: $(expected_desc)"
@@ -1227,9 +1270,12 @@ cmd_test() {
   }
   line() { printf '%-5s %-48s %s\n' "$1" "$2" "${3:-}"; }
   check() { # label want(ok|fail) got(ok|fail) detail
-    if [[ $mode != protected ]]; then line INFO "$1" "$3${4:+ ($4)}"
-    elif [[ $2 == "$3" ]]; then line PASS "$1" "$3${4:+ ($4)}"
-    else line FAIL "$1" "$3${4:+ ($4)}"; fails=$((fails + 1))
+    local got=$3
+    # Leak checks want no answer: say what happened, not ok/fail.
+    if [[ $2 == fail ]]; then [[ $3 == fail ]] && got="no answer (blocked)" || got="answered directly"; fi
+    if [[ $mode != protected ]]; then line INFO "$1" "$got${4:+ ($4)}"
+    elif [[ $2 == "$3" ]]; then line PASS "$1" "$got${4:+ ($4)}"
+    else line FAIL "$1" "$got${4:+ ($4)}"; fails=$((fails + 1))
     fi
   }
   skip() { # label reason required(1|0)
@@ -1238,6 +1284,9 @@ cmd_test() {
     [[ ${3:-0} == 1 && $mode == protected ]] && missing=$((missing + 1))
     return 0
   }
+  unconfirm() { [[ " $unconfirmed " == *" $1 "* ]] || unconfirmed="${unconfirmed:+$unconfirmed }$1"; }
+  # label what(ipv4|udp|ipv6) required reason: blocking could not be proven
+  inconclusive() { skip "$1" "$4" "$3"; unconfirm "$2"; }
 
   if [[ $mode == protected ]]; then
     pf_enabled && pf_has_label "$(pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | awk -F'"' '/label "tunlock-/ { print $2 }')" \
@@ -1251,6 +1300,8 @@ cmd_test() {
   local loc=''
   read -r ip loc <<< "$(trace -4 --interface "$TUN_ADDR" "$PROBE_URL" || true)"
   egress_matches "$ip" "$loc" && r=ok || r=fail
+  local tun_ip=''
+  [[ $r == ok ]] && tun_ip=$ip
   check "tunnel HTTPS by IP ($PROBE_IP)" ok "$r" "${ip:-no answer}${loc:+ $loc}"
   read -r ip loc <<< "$(trace -4 https://www.cloudflare.com/cdn-cgi/trace || true)"
   egress_matches "$ip" "$loc" && r=ok || r=fail
@@ -1275,8 +1326,8 @@ cmd_test() {
   # its own addresses (any range) and resolves inside the tunnel: a known name
   # with known addresses tells the two apart.
   local dns known
-  known=$(dig +short +time=3 +tries=1 one.one.one.one A 2>/dev/null | head -1)
-  dns=$(dig +short +time=3 +tries=1 whoami.akamai.net 2>/dev/null | head -1)
+  known=$({ dig +short +time=3 +tries=1 one.one.one.one A 2>/dev/null || true; } | head -1)
+  dns=$({ dig +short +time=3 +tries=1 whoami.akamai.net 2>/dev/null || true; } | head -1)
   if [[ -n $known && $known != 1.1.1.1 && $known != 1.0.0.1 ]]; then
     line INFO "DNS" "the TUN app answers DNS itself (fake-IP, e.g. $known): names resolve inside the tunnel"
   elif [[ -n $dns ]]; then
@@ -1296,32 +1347,71 @@ cmd_test() {
   fi
 
   if [[ -z $phys ]]; then
-    skip "direct IPv4 / UDP / IPv6" "no Wi-Fi or Ethernet connection" 1
+    skip "direct IPv4 / UDP / IPv6" "no Wi-Fi or Ethernet connection: blocking not confirmed" 1
+    unconfirm ipv4; unconfirm udp; unconfirm ipv6
   else
+    # Blocked means no answer on the physical link from a target that does
+    # answer: through the tunnel (the default route in protected mode).
     reach -4 --interface "$phys" https://1.1.1.1/ && r=ok || r=fail
-    check "direct IPv4 TCP on $phys, no DNS" fail "$r"
+    if [[ $mode == protected && $r == fail ]] && ! reach -4 https://1.1.1.1/; then
+      inconclusive "direct IPv4 TCP on $phys, no DNS" ipv4 1 \
+        "no answer, but 1.1.1.1 does not answer through the tunnel either: blocking not confirmed"
+    else
+      check "direct IPv4 TCP on $phys, no DNS" fail "$r"
+    fi
     # A raw DNS query for example.com over UDP, forced onto the physical link.
     local query='\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
-    [[ $(printf '%b' "$query" | nc -u -b "$phys" -w 2 1.1.1.1 53 2>/dev/null | wc -c) -gt 0 ]] && r=ok || r=fail
-    check "direct UDP DNS to 1.1.1.1 on $phys" fail "$r"
+    udp_dns() { printf '%b' "$query" | nc -u "$@" -w 2 1.1.1.1 53 2>/dev/null | wc -c; }
+    (( $(udp_dns -b "$phys") > 0 )) && r=ok || r=fail
+    # The control must come from 1.1.1.1 itself: a TUN app that answers DNS
+    # on its own would answer anything. Cloudflare's whoami names the address
+    # it saw, which through the tunnel is the verified exit.
+    local seen
+    # A timeout (dig exits 9) is no answer, never the end of the test.
+    seen=$({ dig +short +time=2 +tries=1 @1.1.1.1 whoami.cloudflare CH TXT 2>/dev/null || true; } | tr -d '"' | head -1)
+    if [[ $mode == protected && $r == fail ]] && [[ -z $tun_ip || $seen != "$tun_ip" ]]; then
+      inconclusive "direct UDP DNS to 1.1.1.1 on $phys" udp 0 \
+        "no answer, but 1.1.1.1 did not answer through the tunnel as itself (seen: ${seen:-nothing}): blocking not confirmed"
+    else
+      check "direct UDP DNS to 1.1.1.1 on $phys" fail "$r"
+    fi
     ifconfig "$phys" | awk '$1 == "inet6" && $2 !~ /^fe80/ { f = 1 } END { exit !f }' && has6=1
     if (( has6 )); then
+      local net base label
+      net=$(ipv6_network "$phys")
+      base=$(ipv6_baseline "$net")
       reach -6 --interface "$phys" 'https://[2606:4700:4700::1111]/' && r=ok || r=fail
-      check "direct IPv6 on $phys" fail "$r"
-      reach -6 'https://[2606:4700:4700::1111]/' && r=ok || r=fail
-      check "IPv6 over the default route" fail "$r"
+      [[ $mode == protected ]] || ipv6_baseline_save "$net" "$([[ $r == ok ]] && echo 1 || echo 0)"
+      for label in "direct IPv6 on $phys" "IPv6 over the default route"; do
+        if [[ $label == "IPv6 over the default route" ]]; then
+          reach -6 'https://[2606:4700:4700::1111]/' && r=ok || r=fail
+        fi
+        if [[ $mode != protected || $r == ok || $base == 1 ]]; then
+          check "$label" fail "$r"
+        elif [[ -z $net ]]; then
+          inconclusive "$label" ipv6 0 "no answer, and this IPv6 network cannot be identified (router or prefix unknown): blocking not confirmed"
+        elif [[ $base == 0 ]]; then
+          inconclusive "$label" ipv6 0 "no answer, but IPv6 did not answer in the direct reference run here either: blocking not confirmed"
+        else
+          inconclusive "$label" ipv6 0 "no answer, but IPv6 was not seen working on this network in the last day: blocking not confirmed (reference: tunlock off, then sudo tunlock test)"
+        fi
+      done
     else
-      skip "IPv6" "no IPv6 address on $phys: run again on a network with IPv6"
+      skip "IPv6" "no IPv6 address on $phys: IPv6 blocking not confirmed on this network"
+      unconfirm ipv6
     fi
   fi
 
   if [[ $mode != protected ]]; then
-    echo "Direct mode: reference only. Note whether IPv6 works here; on such a network,"
-    echo "run the test again in protected mode to prove IPv6 is blocked."
+    echo "Direct mode: reference only, nothing is protected."
+    if (( has6 )); then
+      echo "IPv6 reference saved for this network: a protected run here can now confirm IPv6 is blocked."
+    fi
     echo "RESULT=baseline"
     return 0
   fi
   echo "SKIPPED=$skipped"
+  echo "UNCONFIRMED=$unconfirmed"
   if (( fails )); then echo "RESULT=fail"; return 1; fi
   if (( missing )); then echo "RESULT=incomplete"; return 3; fi
   echo "RESULT=pass"

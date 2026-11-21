@@ -51,6 +51,11 @@ enum ConfigModelTests {
         x.sshUser = "me"
         let xr = x.render()
         check("keys the form has no field for are kept on save", xr.contains("SSH_HOST=\"198.51.100.9\"") && xr.contains("PROBE_URL=\"https://1.0.0.1/cdn-cgi/trace\""))
+        let cr = LeakOutput("PASS a\rSKIP ipv6 no baseline\rUNCONFIRMED=ipv6\rRESULT=pass\r")
+        check("leak test: CR line breaks keep UNCONFIRMED", cr.unconfirmed == ["ipv6"] && cr.result == "pass")
+        check("leak test: metadata is not shown as lines", cr.lines == ["PASS a", "SKIP ipv6 no baseline"])
+        let lf = LeakOutput("PASS a\nUNCONFIRMED=ipv4 udp\nRESULT=pass\n")
+        check("leak test: LF line breaks too", lf.unconfirmed == ["ipv4", "udp"] && lf.lines == ["PASS a"])
         exit(failures == 0 ? 0 : 1)
     }
 }

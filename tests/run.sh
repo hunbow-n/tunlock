@@ -485,6 +485,103 @@ rm -rf "$psfail"
 expect_eq "off without a terminal does not ask (the app asks itself)" \
   "$(S=$(mktemp -d); TUNLOCK_AI_APPS=bash TUNLOCK_TEST_NO_GUARD=1 TUNLOCK_TEST_PATH=$STUBS TUNLOCK_STATE_DIR=$S/db TUNLOCK_RUN_DIR=$S/run STUB=$S $T off 2>&1 | grep -c 'Turn off anyway'; rm -rf "$S")" "0"
 
+# ---- leak test: "no answer" proves blocking only from a target known to answer
+# Own stubs: $LT/<switch> files say what answers. direct4/direct6/route6: the
+# leak paths; ctrl4: 1.1.1.1 answers through the tunnel; ctrl_udp: 1.1.1.1
+# answers DNS through the tunnel as itself (whoami = the exit), ctrl_udp_fake:
+# something else answers in its place; udp: the direct UDP query; has6/v6gw:
+# the network has IPv6 and an IPv6 router; mac2: another router behind the
+# same fe80::1.
+LTS=$(mktemp -d); cp "$STUBS"/* "$LTS/"
+cat > "$LTS/curl" <<'STUB'
+#!/bin/bash
+v='' bound=0 url=''
+for a in "$@"; do case $a in -4) v=4 ;; -6) v=6 ;; --interface) bound=1 ;; https://*) url=$a ;; esac; done
+if [[ $url == */cdn-cgi/trace ]]; then echo "ip=203.0.113.10"; exit 0; fi
+case $v$bound in
+  41) f=direct4 ;; 40) f=ctrl4 ;; 61) f=direct6 ;; 60) f=route6 ;; *) exit 2 ;;
+esac
+[[ -e $STUB/$f ]] || exit 28
+STUB
+cat > "$LTS/nc" <<'STUB'
+#!/bin/bash
+cat > /dev/null
+for a in "$@"; do [[ $a == -b ]] && { [[ ! -e $STUB/udp ]] || printf 'answer'; }; done
+exit 0
+STUB
+cat > "$LTS/ndp" <<'STUB'
+#!/bin/bash
+echo "Neighbor                                Linklayer Address  Netif Expire    St Flgs Prbs"
+[[ -e $STUB/mac2 ]] && mac=aa:bb:cc:00:00:02 || mac=aa:bb:cc:00:00:01
+echo "fe80::1%en0                             $mac  en0 permanent R"
+STUB
+cat > "$LTS/route" <<'STUB'
+#!/bin/bash
+[[ -e $STUB/v6gw ]] && echo "    gateway: fe80::1%en0"
+exit 0
+STUB
+cat > "$LTS/ifconfig" <<'STUB'
+#!/bin/bash
+echo "  inet 192.168.1.45 netmask 0xffffff00"
+[[ -e $STUB/has6 ]] && echo "  inet6 2001:db8::5 prefixlen 64 autoconf secured"
+exit 0
+STUB
+cat > "$LTS/dig" <<'STUB'
+#!/bin/bash
+[[ -e $STUB/dig_timeout_all ]] && exit 9
+[[ " $* " == *" whoami.cloudflare "* ]] || exit 0
+[[ -e $STUB/dig_timeout ]] && exit 9
+if [[ -e $STUB/ctrl_udp ]]; then echo '"203.0.113.10"'; elif [[ -e $STUB/ctrl_udp_fake ]]; then echo '"198.18.0.7"'; fi
+exit 0
+STUB
+chmod +x "$LTS"/*
+lt() { # mode, then switches to create; prints the result lines and the labelled SKIP/PASS/FAIL tags
+  STUB=$(mktemp -d); mkdir -p "$STUB/db" "$STUB/run"; export STUB
+  echo "$1" > "$STUB/db/mode"; shift
+  touch "$STUB/enabled"; echo 'block drop quick all label "tunlock-x"' > "$STUB/anchor"
+  local f; for f in "$@"; do touch "$STUB/$f"; done
+  TUNLOCK_TEST_PATH=$LTS TUNLOCK_CONF=$F/good.conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
+    $T test 2>&1 | awk '/^(PASS|FAIL|SKIP|INFO) +direct|^(PASS|FAIL|SKIP|INFO) +IPv6|^UNCONFIRMED=|^RESULT=/ { print ($1 ~ /^UNCONFIRMED=/ ? $0 : $1) }' | paste -sd' ' -
+}
+expect_eq "leak test: IPv6 without a reference run on this network stays unconfirmed" \
+  "$(lt protected ctrl4 ctrl_udp has6 v6gw)" "PASS PASS SKIP SKIP UNCONFIRMED=ipv6 RESULT=pass"
+expect_eq "leak test: no IPv6 on the network says IPv6 blocking is unconfirmed" \
+  "$(lt protected ctrl4 ctrl_udp)" "PASS PASS SKIP UNCONFIRMED=ipv6 RESULT=pass"
+expect_eq "leak test: IPv4 without an answer through the tunnel is not proof: incomplete" \
+  "$(lt protected ctrl_udp)" "SKIP PASS SKIP UNCONFIRMED=ipv4 ipv6 RESULT=incomplete"
+expect_eq "leak test: no UDP through the tunnel leaves UDP unconfirmed" \
+  "$(lt protected ctrl4)" "PASS SKIP SKIP UNCONFIRMED=udp ipv6 RESULT=pass"
+expect_eq "leak test: a DNS answer that is not from 1.1.1.1 does not confirm UDP blocking" \
+  "$(lt protected ctrl4 ctrl_udp_fake)" "PASS SKIP SKIP UNCONFIRMED=udp ipv6 RESULT=pass"
+expect_eq "leak test: a timed-out UDP control is a SKIP and the test goes on" \
+  "$(lt protected ctrl4 dig_timeout has6 v6gw)" "PASS SKIP SKIP SKIP UNCONFIRMED=udp ipv6 RESULT=pass"
+expect_eq "leak test: DNS timing out everywhere does not end the test" \
+  "$(lt protected ctrl4 dig_timeout_all)" "PASS SKIP SKIP UNCONFIRMED=udp ipv6 RESULT=pass"
+expect_eq "leak test: a direct answer is a leak whatever the control says" \
+  "$(lt protected ctrl_udp direct4 has6 v6gw direct6)" "FAIL PASS FAIL SKIP UNCONFIRMED=ipv6 RESULT=fail"
+# A direct reference run on this network makes IPv6 provable.
+STUB_KEEP=$(mktemp -d)
+lt_chain() { # mode switches...: like lt, on one persistent state dir
+  local mode=$1; shift
+  STUB=$STUB_KEEP; mkdir -p "$STUB/db" "$STUB/run"; export STUB
+  rm -f "$STUB"/direct6 "$STUB"/route6; echo "$mode" > "$STUB/db/mode"
+  touch "$STUB/enabled"; echo 'block drop quick all label "tunlock-x"' > "$STUB/anchor"
+  local f; for f in "$@"; do touch "$STUB/$f"; done
+  TUNLOCK_TEST_PATH=$LTS TUNLOCK_CONF=$F/good.conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
+    $T test 2>&1 | awk '/^(PASS|FAIL|SKIP|INFO) +direct|^(PASS|FAIL|SKIP|INFO) +IPv6|^UNCONFIRMED=|^RESULT=/ { print ($1 ~ /^UNCONFIRMED=/ ? $0 : $1) }' | paste -sd' ' -
+}
+expect_eq "leak test: the direct run is reference only and saves the IPv6 baseline" \
+  "$(lt_chain direct ctrl4 ctrl_udp has6 v6gw direct6 route6) $(awk '{ print $1, $2 }' "$STUB_KEEP/db/ipv6-baseline")" \
+  "INFO INFO INFO INFO RESULT=baseline en0|fe80::1%en0|aa:bb:cc:00:00:01|2001:db8:0:0 1"
+expect_eq "leak test: after that reference, no IPv6 answer counts as blocked" \
+  "$(lt_chain protected ctrl4 ctrl_udp has6 v6gw)" "PASS PASS PASS PASS UNCONFIRMED= RESULT=pass"
+expect_eq "leak test: another network behind the same router address gets no reference" \
+  "$(lt_chain protected ctrl4 ctrl_udp has6 v6gw mac2; rm -f "$STUB_KEEP/mac2")" "PASS PASS SKIP SKIP UNCONFIRMED=ipv6 RESULT=pass"
+awk '{ $3 = $3 - 90000; print }' "$STUB_KEEP/db/ipv6-baseline" > "$STUB_KEEP/b" && mv "$STUB_KEEP/b" "$STUB_KEEP/db/ipv6-baseline"
+expect_eq "leak test: a reference older than a day proves nothing" \
+  "$(lt_chain protected ctrl4 ctrl_udp has6 v6gw)" "PASS PASS SKIP SKIP UNCONFIRMED=ipv6 RESULT=pass"
+rm -rf "$STUB_KEEP" "$LTS"
+
 # The app's config model (Swift), when a Swift compiler is around.
 if command -v swiftc >/dev/null; then
   while IFS= read -r line; do

@@ -854,10 +854,7 @@ enum LeakResult {
     case pass, fail, incomplete, baseline, didNotRun
 
     init(output: String) {
-        let result = output.split(whereSeparator: { $0.isNewline })
-            .last { $0.hasPrefix("RESULT=") }
-            .map { String($0.dropFirst(7)) }
-        switch result {
+        switch LeakOutput(output).result {
         case "pass": self = .pass
         case "fail": self = .fail
         case "incomplete": self = .incomplete
@@ -900,15 +897,21 @@ struct LeakTestView: View {
 
     var body: some View {
         let output = model.testOutput ?? ""
-        let lines = output.split(separator: "\n").map(String.init)
-            .filter { !$0.hasPrefix("RESULT=") && !$0.hasPrefix("SKIPPED=") }
+        let parsed = LeakOutput(output)
+        let lines = parsed.lines
         let result = LeakResult(output: output)
         let skipped = lines.filter { $0.hasPrefix("SKIP") }.count
+        let unconfirmed = unconfirmedBlocking(parsed.unconfirmed)
         VStack(alignment: .leading, spacing: 12) {
             Label(result.title, systemImage: result.symbol)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(result.color)
-            if result == .pass, skipped > 0 {
+            if result != .baseline, !unconfirmed.isEmpty {
+                Text(L("Not confirmed on this network: \(unconfirmed.joined(separator: ", ")). No answer there does not prove blocking; the reasons are in SKIP below.",
+                       "В этой сети не подтверждено: \(unconfirmed.joined(separator: ", ")). Отсутствие ответа здесь ещё не доказывает блокировку, причины — в строках SKIP ниже."))
+                    .font(.callout).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if result == .pass, skipped > 0 {
                 Text(L("\(skipped) check(s) could not run on this network, see SKIP below.",
                        "Проверок, которые нельзя выполнить в этой сети: \(skipped), см. SKIP ниже."))
                     .font(.callout).foregroundStyle(.orange)
@@ -929,6 +932,18 @@ struct LeakTestView: View {
         }
         .padding(18)
         .frame(width: 640, height: 360)
+    }
+
+    /// What the run could not prove blocked, from its UNCONFIRMED= line.
+    private func unconfirmedBlocking(_ items: [String]) -> [String] {
+        items.map { item -> String in
+            switch item {
+            case "ipv4": return L("IPv4 blocking", "блокировка IPv4")
+            case "udp": return L("UDP blocking", "блокировка UDP")
+            case "ipv6": return L("IPv6 blocking", "блокировка IPv6")
+            default: return item
+            }
+        }
     }
 
     private func color(of line: String) -> Color {
