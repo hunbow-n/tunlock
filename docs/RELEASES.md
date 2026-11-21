@@ -1,9 +1,12 @@
 # Verifying a release
 
-On each push to `main`, GitHub Actions queues the release build. After the
-build and live PF tests pass, it publishes a regular GitHub Release with the
-next patch version. The app and bundled CLI use that version. The release
-notes list commit subjects since the previous release tag.
+On each push to `main`, GitHub Actions runs the build and live PF tests.
+It reads commits since the previous release tag and picks the highest
+version bump under the [commit rules](../AGENTS.md). A push with only
+maintenance or unclassified commits runs CI without publishing a release.
+For a release, the tag, app, and bundled CLI use the calculated version.
+The release notes list commit subjects since the previous release tag
+and include migration guidance from `BREAKING CHANGE:` footers.
 
 If an upload fails after the tag is created, rerun the failed publication
 job to resume the release for that commit.

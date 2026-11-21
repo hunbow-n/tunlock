@@ -37,11 +37,13 @@ jobs:
         run: |
           previous_tag=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
           if [[ -n "$previous_tag" ]]; then
-            if [[ ! "$previous_tag" =~ ^v([0-9]+\.[0-9]+)\.(0|[1-9][0-9]*)$ ]]; then
+            if [[ ! "$previous_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
               echo "Cannot increment release tag $previous_tag" >&2
               exit 1
             fi
-            version="${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1))"
+            major=${BASH_REMATCH[1]}
+            minor=${BASH_REMATCH[2]}
+            patch=${BASH_REMATCH[3]}
             previous_commit=$(git rev-parse "refs/tags/${previous_tag}^{commit}")
             if git merge-base --is-ancestor "$GITHUB_SHA" "$previous_commit"; then
               echo "This commit is already covered by $previous_tag."
@@ -56,8 +58,47 @@ jobs:
             version=$(awk -F= '$1 == "VERSION" { print $2; exit }' bin/tunlock)
             range="$GITHUB_SHA"
           fi
+
+          # Read complete commit messages. A breaking-change footer can appear after the body.
+          breaking_header='^[a-z][a-z0-9-]*(\([^)]+\))?!:[[:blank:]]+'
+          breaking_footer=$'(^|\n)BREAKING[ -]CHANGE:[[:blank:]]+([^[:space:]][^\n]*)'
+          feature_header='^feat(\([^)]+\))?:[[:blank:]]+'
+          fix_header='^(fix|perf)(\([^)]+\))?:[[:blank:]]+'
+          notes="$RUNNER_TEMP/tunlock-release-notes.md"
+          : > "$notes"
+          bump=$(git log -z --format='%s%x00%b' "$range" | {
+            level=0
+            while IFS= read -r -d '' subject && IFS= read -r -d '' body; do
+              printf -- '- %s\n' "$subject" >> "$notes"
+              if [[ "$body" =~ $breaking_footer ]]; then
+                printf '  - **Breaking change:** %s\n' "${BASH_REMATCH[2]}" >> "$notes"
+                level=3
+              elif [[ "$subject" =~ $breaking_header ]]; then
+                level=3
+              elif [[ $level -lt 2 && "$subject" =~ $feature_header ]]; then
+                level=2
+              elif [[ $level -eq 0 && "$subject" =~ $fix_header ]]; then
+                level=1
+              fi
+            done
+            printf '%s\n' "$level"
+          })
+          if [[ $bump -eq 0 ]]; then
+            echo "No release-triggering commits."
+            exit 0
+          fi
+          if [[ -n "$previous_tag" ]]; then
+            if [[ $bump -eq 3 && $major -gt 0 ]]; then
+              version="$((major + 1)).0.0"
+            elif [[ $bump -ge 2 ]]; then
+              version="$major.$((minor + 1)).0"
+            else
+              version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+
           mkdir -p build
-          git log --format='- %s' "$range" > build/release-notes.md
+          cp "$notes" build/release-notes.md
           echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
           echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
           echo "TUNLOCK_BUILD_VERSION=$version" >> "$GITHUB_ENV"
