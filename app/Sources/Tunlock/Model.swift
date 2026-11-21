@@ -64,6 +64,24 @@ enum Verdict {
     }
 }
 
+/// Why off asks first.
+enum OffPrompt: Equatable {
+    case clients([String])
+    case checkFailed
+
+    var message: String {
+        switch self {
+        case .clients(let processes):
+            let list = aiDisplayNames(processes).joined(separator: ", ")
+            return L("\(list): their next request will leave with your direct IP. Close them first (/exit in Claude Code), then turn Tunlock off.",
+                     "\(list): их следующий запрос уйдёт с вашим прямым IP. Сначала закройте их (/exit в Claude Code), потом выключайте Tunlock.")
+        case .checkFailed:
+            return L("Tunlock could not check for running AI apps. If Claude Code, Codex or ChatGPT is open, its next request will leave with your direct IP.",
+                     "Tunlock не смог проверить, запущены ли AI-приложения. Если открыт Claude Code, Codex или ChatGPT, его следующий запрос уйдёт с вашим прямым IP.")
+        }
+    }
+}
+
 @MainActor
 final class StatusModel: ObservableObject {
     static let shared = StatusModel()
@@ -82,6 +100,11 @@ final class StatusModel: ObservableObject {
     @Published var busy: String?
     @Published var message: String?
     @Published var testOutput: String?
+    /// Set when off was asked while AI clients run, or when that could not be checked.
+    @Published var offPrompt: OffPrompt?
+    /// AI clients running now (display names), checked every few seconds.
+    @Published private(set) var aiClients: [String] = []
+    private var aiCheckedAt = Date.distantPast
 
     private var meter = RateMeter()
     private var timer: Timer?
@@ -126,8 +149,22 @@ final class StatusModel: ObservableObject {
             rate = nil
         }
         checkDirectIP()
+        checkAIClients()
         trackVerdict()
         watchDraft()
+    }
+
+    private func checkAIClients() {
+        guard Date().timeIntervalSince(aiCheckedAt) > 3 else { return }
+        aiCheckedAt = Date()
+        Task { aiClients = aiDisplayNames(await runningAIProcesses() ?? []) }
+    }
+
+    /// Process names of the AI clients running now; nil when the check failed.
+    func runningAIProcesses() async -> [String]? {
+        let r = await run(Paths.bundledCLI, ["ai-clients"])
+        guard r.ok else { return nil }
+        return r.output.split(separator: "\n").map { clean(String($0)) }.filter { !$0.isEmpty }
     }
 
     private func checkDirectIP() {
@@ -175,6 +212,49 @@ final class StatusModel: ObservableObject {
                         "Фоновая служба не запущена. Откройте настройки и нажмите «Сохранить и применить».")
             return
         }
+        if !protected {
+            // A client opened under protection keeps its session and reconnects
+            // with the direct IP once the rules are gone: ask first.
+            Task { await askOff() }
+            return
+        }
+        switchMode(true)
+    }
+
+    private func askOff() async {
+        // A failed check is not "none running": the user decides.
+        guard let processes = await runningAIProcesses() else { offPrompt = .checkFailed; return }
+        aiClients = aiDisplayNames(processes)
+        if processes.isEmpty { turnOff(confirmed: []) } else { offPrompt = .clients(processes) }
+    }
+
+    /// Turns off after the AI clients warning was confirmed.
+    func turnOffAnyway() {
+        let confirmed: [String]
+        switch offPrompt {
+        case .clients(let processes): confirmed = processes
+        case .checkFailed: confirmed = ["?"]
+        case nil: confirmed = []
+        }
+        offPrompt = nil
+        turnOff(confirmed: confirmed)
+    }
+
+    /// The password prompt may wait for minutes: the CLI checks the clients
+    /// again as root right before the rules go, against what was confirmed here.
+    private func turnOff(confirmed: [String]) {
+        do {
+            try FileManager.default.createDirectory(atPath: Paths.draftDir, withIntermediateDirectories: true)
+            try (confirmed.map { $0 + "\n" }.joined()).write(toFile: Paths.offAck, atomically: true, encoding: .utf8)
+        } catch {
+            message = L("Could not save the confirmation (\(error.localizedDescription)). Turn off in Terminal: tunlock off",
+                        "Не удалось сохранить подтверждение (\(error.localizedDescription)). Выключите в терминале: tunlock off")
+            return
+        }
+        switchMode(false)
+    }
+
+    private func switchMode(_ protected: Bool) {
         let cmd = protected ? "on" : "off"
         busy = protected ? L("Turning on: firewall, then SSH and the TUN app…", "Включаю: сначала файрвол, потом SSH и TUN-приложение…")
                          : L("Turning off…", "Выключаю…")
@@ -182,6 +262,16 @@ final class StatusModel: ObservableObject {
         Task {
             let r = await runCLIAsRoot(cmd)
             busy = nil
+            if !protected {
+                // Normally used up by the CLI; a cancelled prompt leaves it.
+                try? FileManager.default.removeItem(atPath: Paths.offAck)
+                if !r.ok, r.output.contains("after the confirmation") || r.output.contains("could not check AI clients again") {
+                    // Something started while the password prompt waited: ask again.
+                    await askOff()
+                    refresh()
+                    return
+                }
+            }
             if !r.ok && !r.cancelled {
                 // The CLI ends with the reason; the panel shows the details already.
                 message = r.output.split(separator: "\n").last { $0.hasPrefix("tunlock:") }.map(String.init)
@@ -316,5 +406,22 @@ final class StatusModel: ObservableObject {
             if !r.ok && !r.cancelled { message = r.output }
             refresh()
         }
+    }
+}
+
+/// Product names for the panel, without duplicates.
+func aiDisplayNames(_ processes: [String]) -> [String] {
+    var names: [String] = []
+    for name in processes.map(aiAppName) where !names.contains(name) { names.append(name) }
+    return names
+}
+
+/// The CLI reports process names; the panel shows product names.
+func aiAppName(_ process: String) -> String {
+    switch process {
+    case "claude": return "Claude Code"
+    case "Claude": return "Claude"
+    case "codex": return "Codex"
+    default: return process
     }
 }

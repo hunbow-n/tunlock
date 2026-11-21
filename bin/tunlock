@@ -16,6 +16,8 @@ STATE_DIR=${TUNLOCK_STATE_DIR:-/var/db/tunlock}  # persistent: chosen mode
 RUN_DIR=${TUNLOCK_RUN_DIR:-/var/run/tunlock}     # cleared at boot: live state
 RESOLVER_DIR=${TUNLOCK_RESOLVER_DIR:-/etc/resolver}
 RESOLVER_MARK='# managed by tunlock'
+# AI clients that keep a session open and would reconnect directly once off.
+AI_APPS=${TUNLOCK_AI_APPS:-"claude Claude codex ChatGPT Cursor"}
 GUARD_LABEL=tunlock.guard
 SSH_LABEL=tunlock.ssh
 TICK=2
@@ -1016,10 +1018,78 @@ cmd_protect() {
   esac
 }
 
+# Running AI clients, one name per line. A client started under protection
+# keeps its session: after off its next request leaves with the direct IP.
+# Exit 1 when the process list cannot be read: "none found" must mean none.
+ai_clients() {
+  local comms args
+  comms=$(ps -axo comm= 2>/dev/null) && [[ -n $comms ]] || { echo "tunlock: cannot list processes" >&2; return 1; }
+  args=$(ps -axo args= 2>/dev/null) || { echo "tunlock: cannot list processes" >&2; return 1; }
+  {
+    awk '{ sub(/.*\//, ""); print }' <<< "$comms"
+    # Claude Code installed with npm runs as node.
+    [[ $args != */claude-code/cli* ]] || echo claude
+  } | awk -v names="$AI_APPS" '
+    BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    ($0 in want) && !seen[$0]++' | sort
+}
+
+# Off in a terminal asks first while AI clients run, or when it cannot tell;
+# --force skips it. Runs after elevate, so plain and sudo off ask the same,
+# and once. The app asks on its own, then runs plain off (no tty there).
+confirm_off() {
+  local clients answer
+  [[ ${1:-} != --force && -t 0 ]] || return 0
+  if clients=$(ai_clients); then
+    [[ -n $clients ]] || return 0
+    echo "Still running: $(paste -sd, - <<< "$clients" | sed 's/,/, /g')."
+    echo "Once off, their next request leaves with your direct IP. Close them first (/exit in Claude Code)."
+  else
+    echo "Could not check for running AI clients (Claude Code, Codex, ChatGPT)."
+    echo "If any is open, its next request leaves with your direct IP once off."
+  fi
+  read -r -p "Turn off anyway? [y/N] " answer || answer=
+  [[ $answer == [yY]* ]] || { echo "Left on."; return 1; }
+}
+
+# The app asks before off, then a password prompt may wait for minutes. It
+# leaves what the user confirmed in this file: process names, or "?" for a
+# check that failed. Off reads it as root and checks again just before the
+# rules go: a client started since the question keeps protection on.
+OFF_ACK_NAME='Library/Application Support/Tunlock/off-ack'
+off_ack_path() {
+  if [[ -n ${TUNLOCK_TEST_PATH:-} ]]; then echo "${TUNLOCK_OFF_ACK:-/nonexistent}"; return; fi
+  local home
+  home=$(dscl . -read "/Users/$(id -un "$(console_uid)")" NFSHomeDirectory 2>/dev/null | awk '{ print $2 }')
+  [[ -n $home ]] && echo "$home/$OFF_ACK_NAME"
+}
+
+# No file: not the app, nothing to compare. The file is used up either way.
+check_off_ack() {
+  local ack acked clients name new=()
+  ack=$(off_ack_path) || return 0
+  [[ -n $ack && -f $ack && ! -L $ack ]] || return 0
+  acked=$(head -c 4096 "$ack" 2>/dev/null || true)
+  rm -f "$ack"
+  if ! clients=$(ai_clients); then
+    grep -qx '?' <<< "$acked" && return 0
+    echo "tunlock: could not check AI clients again before off; left on" >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    [[ -z $name ]] || grep -qxF -- "$name" <<< "$acked" || new+=("$name")
+  done <<< "$clients"
+  (( ${#new[@]} == 0 )) && return 0
+  echo "tunlock: AI clients started after the confirmation: ${new[*]}; left on" >&2
+  return 1
+}
+
 # Exit 0 only when the guard answered this request with direct mode.
 cmd_direct() {
   elevate direct "$@"
+  confirm_off "$@" || return 1
   load_config
+  check_off_ack || return 1
   local limit
   limit=$(wait_limit 10)
   if ! guard_running; then
@@ -1256,7 +1326,9 @@ usage() {
 tunlock $VERSION: SSH tunnel keeper with a pf kill switch for macOS
 
   tunlock on          protect: rules first, then SSH and the TUN client; fails closed
-  tunlock off         everything off: no rules, SSH port freed, TUN client stopped
+  tunlock off         everything off: no rules, SSH port freed, TUN client stopped;
+                      asks first while AI clients run (--force: don't ask)
+  tunlock ai-clients  running AI clients that would reconnect directly once off
                       (protect / direct are the same commands)
   tunlock status      SSH, verified egress IP and pf state  [--porcelain]
   tunlock test        live leak test (sudo)
@@ -1277,6 +1349,7 @@ main() {
     protect | on) cmd_protect "$@" ;;
     direct | off) cmd_direct "$@" ;;
     status) cmd_status "$@" ;;
+    ai-clients) ai_clients ;;
     test) cmd_test "$@" ;;
     doctor) cmd_doctor "$@" ;;
     guard) cmd_guard ;;

@@ -304,6 +304,22 @@ rm -f "$STUB/release_fail"
 expect_eq "direct without a guard succeeds once the rules are really gone" \
   "$(TUNLOCK_TEST_NO_GUARD=1 cli direct) $([[ -e $STUB/run/token ]] && echo token || echo none) $(cat "$STUB/release.log")" "0 none released"
 rm -rf "$STUB"
+# The app's confirmation is checked again as root, just before the rules go.
+ack_off() { # ack contents, path dir: exit code, mode written, ack left or used
+  STUB=$(mktemp -d); mkdir -p "$STUB/db" "$STUB/run"; printf '%s\n' "$1" > "$STUB/ack"
+  export STUB
+  local rc
+  rc=$(TUNLOCK_AI_APPS="nope bash" TUNLOCK_OFF_ACK=$STUB/ack TUNLOCK_TEST_NO_GUARD=1 TUNLOCK_TEST_PATH=${2:-$STUBS} TUNLOCK_CONF=$F/good.conf \
+    TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T off >/dev/null 2>&1; echo $?)
+  echo "$rc $(cat "$STUB/db/mode" 2>/dev/null || echo unchanged) $([[ -e $STUB/ack ]] && echo left || echo used)"
+  rm -rf "$STUB"
+}
+expect_eq "off: a client started after the app's confirmation keeps protection on" "$(ack_off "")" "1 unchanged used"
+expect_eq "off: clients the user confirmed in the app do not stop it" "$(ack_off "bash")" "0 direct used"
+psfail=$(mktemp -d); cp "$STUBS"/* "$psfail/"; printf '#!/bin/bash\nexit 1\n' > "$psfail/ps"; chmod +x "$psfail/ps"
+expect_eq "off: a failed recheck keeps protection on" "$(ack_off "bash" "$psfail")" "1 unchanged used"
+expect_eq "off: a failed recheck passes when the user confirmed a failed check" "$(ack_off "?" "$psfail")" "0 direct used"
+rm -rf "$psfail"
 # on/off drive the TUN client and the SSH keeper, after the guard confirms
 svc_conf=$(mktemp); { cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; } > "$svc_conf"
 clis() { export STUB; TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$svc_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T "$@" >/dev/null 2>&1; echo $?; }
@@ -450,6 +466,16 @@ bad_conf "a probe URL with a host name" "PROBE_URL=https://one.one.one.one/cdn-c
 bad_conf "a bad mask" "TUN_MASK=255.255.255.252"
 bad_conf "a tiny probe interval" "PROBE_INTERVAL=1"
 bad_conf "a bad user" 'SSH_USER=$(id)'
+
+# ---- ai-clients: what would reconnect directly once off
+expect_eq "ai-clients finds a running client by process name" "$(TUNLOCK_AI_APPS="nope bash" $T ai-clients)" "bash"
+expect_eq "ai-clients is empty and succeeds when none run" "$(TUNLOCK_AI_APPS="nope-1 nope-2" $T ai-clients; echo "rc=$?")" "rc=0"
+psfail=$(mktemp -d); printf '#!/bin/bash\nexit 1\n' > "$psfail/ps"; chmod +x "$psfail/ps"
+expect_eq "ai-clients fails when the process list cannot be read" \
+  "$(TUNLOCK_TEST_PATH=$psfail $T ai-clients 2>&1; echo "rc=$?")" "tunlock: cannot list processes"$'\n'"rc=1"
+rm -rf "$psfail"
+expect_eq "off without a terminal does not ask (the app asks itself)" \
+  "$(S=$(mktemp -d); TUNLOCK_AI_APPS=bash TUNLOCK_TEST_NO_GUARD=1 TUNLOCK_TEST_PATH=$STUBS TUNLOCK_STATE_DIR=$S/db TUNLOCK_RUN_DIR=$S/run STUB=$S $T off 2>&1 | grep -c 'Turn off anyway'; rm -rf "$S")" "0"
 
 # The app's config model (Swift), when a Swift compiler is around.
 if command -v swiftc >/dev/null; then

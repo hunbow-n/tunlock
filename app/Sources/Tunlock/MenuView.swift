@@ -26,6 +26,7 @@ struct MenuView: View {
                 .buttonStyle(.borderedProminent)
             } else {
                 modeSwitch
+                if !model.aiClients.isEmpty { aiClientsLine }
                 card { route(v) }
                 card { traffic }
                 extras(v)
@@ -157,9 +158,39 @@ struct MenuView: View {
                 .toggleStyle(PowerSwitchStyle(busy: model.busy != nil))
                 .labelsHidden()
                 .disabled(model.busy != nil)
+                .confirmationDialog(model.offPrompt == .checkFailed ? L("Could not check AI apps", "Не удалось проверить AI-приложения")
+                                                                    : L("AI apps are still running", "AI-приложения ещё запущены"),
+                                    isPresented: Binding(get: { model.offPrompt != nil },
+                                                         set: { if !$0 { model.offPrompt = nil } })) {
+                    Button(L("Turn off anyway", "Всё равно выключить"), role: .destructive) { model.turnOffAnyway() }
+                    Button(L("Keep on", "Оставить включённым"), role: .cancel) { model.offPrompt = nil }
+                } message: {
+                    Text(model.offPrompt?.message ?? "")
+                }
         }
         .padding(Shape.cardPadding)
         .background(Shape.card().fill((on ? Color.green : Color.primary).opacity(on ? 0.12 : 0.05)))
+    }
+
+    /// Which AI apps are running and what happens to their traffic now: from
+    /// the verdict, not the chosen mode (protected mode can be blocked or broken).
+    private var aiClientsLine: some View {
+        let names = model.aiClients.joined(separator: ", ")
+        let (text, icon, color): (String, String, Color)
+        switch model.verdict {
+        case .protected:
+            (text, icon, color) = (L("Running, through Tunlock: \(names)", "Запущены, идут через Tunlock: \(names)"), "sparkles", .secondary)
+        case .blocked:
+            (text, icon, color) = (L("Running, blocked for now: \(names)", "Запущены, пока заблокированы: \(names)"), "exclamationmark.shield", .orange)
+        case .direct:
+            (text, icon, color) = (L("Running, going direct: \(names)", "Запущены, идут напрямую: \(names)"), "exclamationmark.triangle", .orange)
+        default:
+            (text, icon, color) = (L("Running, may go direct: \(names)", "Запущены, могут идти напрямую: \(names)"), "exclamationmark.triangle", .red)
+        }
+        return Label(text, systemImage: icon)
+            .font(.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: route

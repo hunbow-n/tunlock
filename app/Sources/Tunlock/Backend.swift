@@ -14,6 +14,8 @@ enum Paths {
     static var bundledCLI: String { bundled + "/bin/tunlock" }
     /// Where an AI agent's proposed config waits for the user (see MCP.swift).
     static var draftDir: String { NSHomeDirectory() + "/Library/Application Support/Tunlock" }
+    /// What the user confirmed before off; the CLI checks it again as root.
+    static var offAck: String { draftDir + "/off-ack" }
     static var draft: String { ProcessInfo.processInfo.environment["TUNLOCK_UI_DRAFT"] ?? draftDir + "/draft.conf" }
 }
 

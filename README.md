@@ -279,7 +279,8 @@ Everything the app does is also a command:
 
 ```bash
 tunlock on            # firewall first, then SSH and the TUN app
-tunlock off           # nothing blocked, SSH port freed, TUN app stopped
+tunlock off           # nothing blocked, SSH port freed, TUN app stopped; asks first while Claude Code, Codex, ChatGPT run
+tunlock ai-clients    # AI apps still running that would reconnect directly once off
 tunlock status        # SSH, verified exit IP, pf state  (--porcelain for scripts)
 sudo tunlock test     # live leak test: PASS / FAIL / SKIP per check
 tunlock doctor        # check the installation
