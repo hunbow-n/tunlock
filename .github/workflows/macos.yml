@@ -154,7 +154,8 @@ jobs:
           fi
 
           tag_ref="refs/tags/$RELEASE_TAG"
-          tagged_commit=$(git ls-remote "$GITHUB_SERVER_URL/$GH_REPO.git" "$tag_ref" "$tag_ref^{}" \
+          tagged_commit=$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            ls-remote "$GITHUB_SERVER_URL/$GH_REPO.git" "$tag_ref" "$tag_ref^{}" \
             | awk 'NR == 1 || /\^\{\}$/ { commit = $1 } END { print commit }')
           if [[ -z "$tagged_commit" ]]; then
             gh api --method POST "repos/$GH_REPO/git/refs" \
