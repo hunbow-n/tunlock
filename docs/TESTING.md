@@ -7,26 +7,40 @@ nothing about leaks. Leak results come only from a real Mac on real networks.
 Record the macOS version, the network and the output of each run.
 
 `sudo tunlock test` prints one line per check: PASS (behaved as required),
-FAIL (leak or broken tunnel), SKIP (could not be checked on this network) or
-INFO (direct mode, reference only). The last line is `RESULT=pass|fail|incomplete|baseline`.
-A required check that could not run gives `incomplete`, never `pass`.
+FAIL (leak or broken tunnel), SKIP (could not be checked on this network, with
+the reason) or INFO (direct mode, reference only). The last line is
+`RESULT=pass|fail|incomplete|baseline`. A required check that could not run
+gives `incomplete`, never `pass`.
+
+No answer on the physical link proves blocking only when the target is known
+to answer. Otherwise the check is a SKIP, not a PASS:
+
+- IPv4 and UDP: the same target must answer through the tunnel in the same run.
+- IPv6: the tunnel usually has no IPv6, so the control is a direct reference run
+  (`tunlock off`, then `sudo tunlock test`) on the same network: same interface
+  and IPv6 router. It is saved in `/var/db/tunlock/ipv6-baseline`.
+
+Protected runs print `UNCONFIRMED=` with what this run could not prove blocked
+(`ipv4`, `udp`, `ipv6`, or nothing). `RESULT=pass` with `UNCONFIRMED=ipv6` means
+no leak was seen, but IPv6 blocking is not proven on this network.
 
 | check | protected |
 |---|---|
 | pf enabled and the anchor holds a tunlock-labelled set | must pass |
 | HTTPS by IP through `TUN_ADDR` returns `EXPECTED_EGRESS` | must pass |
 | HTTPS by name, system DNS and default route, returns `EXPECTED_EGRESS` | must pass |
-| direct IPv4 TCP on the physical interface, no DNS | must be blocked |
-| direct UDP DNS query to 1.1.1.1 on the physical interface | must be blocked |
-| direct IPv6, and IPv6 over the default route | must be blocked; SKIP if the network has no IPv6 |
+| direct IPv4 TCP on the physical interface, no DNS | must be blocked; SKIP (incomplete) if 1.1.1.1 does not answer through the tunnel either |
+| direct UDP DNS query to 1.1.1.1 on the physical interface | must be blocked; SKIP if no UDP answer comes through the tunnel either |
+| direct IPv6, and IPv6 over the default route | must be blocked; SKIP without IPv6 on the network, or without a direct reference run here that saw IPv6 answer |
 
 Run the protected test with no other kill switch active. Another pf anchor
 evaluated earlier would decide first and hide what tunlock does.
 
 ## Runs
 
-1. **Baseline.** Run `tunlock direct`, then `sudo tunlock test`, and note
-   whether IPv6 works on this network.
+1. **Baseline.** Close AI clients, run `tunlock direct`, then `sudo tunlock test`.
+   It notes whether IPv6 works on this network and saves that as the IPv6
+   reference for protected runs here.
 2. **Protected.** Run `tunlock protect`, then `sudo tunlock test`. All checks
    must pass.
 3. **SSH stopped.** Stop the keeper so launchd does not restart it. The test

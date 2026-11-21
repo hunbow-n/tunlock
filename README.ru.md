@@ -273,7 +273,7 @@ tunlock on            # сначала файрвол, потом SSH и TUN-п�
 tunlock off           # ничего не блокирует, порт SSH свободен, TUN-приложение выключено; спросит, если запущены Claude Code, Codex, ChatGPT
 tunlock ai-clients    # какие AI-приложения запущены и выйдут напрямую после off
 tunlock status        # SSH, проверенный выходной IP, состояние PF (--porcelain для скриптов)
-sudo tunlock test     # живой тест утечек: PASS / FAIL / SKIP по каждой проверке
+sudo tunlock test     # живой тест утечек: PASS / FAIL / SKIP по каждой проверке и что не подтверждено (UNCONFIRMED)
 tunlock doctor        # проверка установки
 ```
 
