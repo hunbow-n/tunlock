@@ -356,20 +356,47 @@ final class StatusModel: ObservableObject {
         }
     }
 
-    /// Why the guard closed the internet, in one line.
+    /// The guard's reason code (see guard_reason in bin/tunlock): "stale"
+    /// when its state is old, "unknown" when a guard writes none.
+    var reason: String {
+        if !installed || stale { return "stale" }
+        return state["reason"].flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
+    }
+
+    /// Why the internet is closed or unprotected, and what to do, in one line.
     func closeReason() -> String {
         let s = state
-        if let ip = s["egress_ip"], !ip.isEmpty, exitIsForeign {
-            return L("The exit changed to ", "Выход сменился на ") + ip + " " + flagEmoji(s["egress_country"] ?? "")
+        switch reason {
+        case "sleep": return L("The Mac is going to sleep. The exit is checked again after wake.",
+                               "Mac засыпает. После пробуждения выход проверится заново.")
+        case "no_tun": return L("No TUN interface. Turn on your TUN app in TUN mode.",
+                                "Нет TUN-интерфейса. Включите TUN-приложение в режиме TUN.")
+        case "entry_down":
+            return L("The TCP port of \(s["entry"] ?? "the entry") does not answer. Check the proxy or server.",
+                     "TCP-порт \(s["entry"] ?? "входа") недоступен. Проверьте прокси или сервер.")
+        case "ssh_down": return L("SSH dropped. Waiting for it to reconnect.", "SSH отвалился. Жду переподключения.")
+        case "exit_mismatch":
+            return L("The exit changed to ", "Выход сменился на ") + (s["egress_ip"] ?? "") + " " + flagEmoji(s["egress_country"] ?? "")
+        case "exit_no_answer": return L("The exit check through the tunnel got no answer. Check the TUN app's connection.",
+                                        "Проверка выхода через туннель не получила ответа. Проверьте подключение TUN-приложения.")
+        case "exit_pending": return L("Checking the exit through the tunnel…", "Проверяю выход через туннель…")
+        case "pf_conflict": return L("Other firewall rules decide before Tunlock.", "Раньше Tunlock решают другие правила файрвола.")
+        case "pf_error": return L("Firewall problem, see below. Run tunlock doctor.", "Сбой файрвола, подробности ниже. Запустите tunlock doctor.")
+        case "pf_disabled": return L("The firewall is off. Tunlock keeps trying to turn it on.", "Файрвол выключен. Tunlock пытается его включить.")
+        case "pf_unreachable": return L("The system firewall does not reach Tunlock's rules. Run tunlock doctor.",
+                                        "Системный файрвол не доходит до правил Tunlock. Запустите tunlock doctor.")
+        case "pf_no_rules": return L("Tunlock's rules are not loaded. Run tunlock doctor.", "Правила Tunlock не загружены. Запустите tunlock doctor.")
+        case "stale": return Verdict.notRunning.explanation
+        default: return L("The reason is unknown. Run tunlock status in Terminal.",
+                          "Причина неизвестна. Запустите tunlock status в Терминале.")
         }
-        if s["upstream"] != "proxy", s["ssh"] == "down" { return L("SSH dropped. Waiting for it to reconnect.", "SSH отвалился. Жду переподключения.") }
-        if (s["tun"] ?? "").isEmpty { return L("The TUN app is off.", "TUN-приложение выключено.") }
-        return L("The exit did not answer. Waiting for a verified tunnel.", "Выход не ответил. Жду подтверждённый туннель.")
     }
 
     /// The last probe answered, but not with our exit.
     var exitIsForeign: Bool {
         let s = state
+        if let check = s["egress_check"] { return check == "mismatch" && !(s["egress_ip"] ?? "").isEmpty }
+        // A guard without egress_check: compare what the state holds.
         guard s["egress_ok"] != "1", let ip = s["egress_ip"], !ip.isEmpty else { return false }
         let expected = s["expected"] ?? "", cc = s["expected_country"] ?? ""
         return (expected != "any" && ip != expected) || (!cc.isEmpty && s["egress_country"] != cc)

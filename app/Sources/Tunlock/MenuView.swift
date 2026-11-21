@@ -118,7 +118,7 @@ struct MenuView: View {
                         }
                     }
                 } else {
-                    Text(v == .blocked && model.mode == "protected" ? model.closeReason() : v.explanation)
+                    Text((v == .blocked || v == .unprotected) && model.mode == "protected" ? model.closeReason() : v.explanation)
                         .font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -211,14 +211,12 @@ struct MenuView: View {
                     let up = s["entry_up"]
                     Hop(status: up == "up" ? .good : up == "down" ? .bad : .neutral,
                         title: L("Proxy", "Прокси") + (entryName.isEmpty ? "" : " · \(entryName)"),
-                        detail: (s["entry"] ?? "") + " · " + (up == "up" ? L("reachable", "доступен")
-                            : up == "down" ? L("not reachable", "недоступен") : L("checking", "проверяю")))
+                        detail: (s["entry"] ?? "") + " · " + entryCheck(up))
                 } else if s["cascade"] == "1" {
                     let up = s["entry_up"]
                     Hop(status: up == "up" ? .good : up == "down" ? .bad : .neutral,
                         title: L("Entry", "Вход") + (entryName.isEmpty ? "" : " · \(entryName)"),
-                        detail: (s["entry"] ?? "") + " · " + (up == "up" ? L("reachable", "доступен")
-                            : up == "down" ? L("not reachable", "недоступен") : L("checking", "проверяю")))
+                        detail: (s["entry"] ?? "") + " · " + entryCheck(up))
                 }
                 Hop(status: exitStatus(s), title: L("Exit", "Выход") + (exitName.isEmpty ? "" : " · \(exitName)"),
                     detail: exitDetail(s))
@@ -229,6 +227,12 @@ struct MenuView: View {
                     last: true)
             }
         }
+    }
+
+    /// The entry check only opens a TCP connection; the exit is checked separately.
+    private func entryCheck(_ up: String?) -> String {
+        up == "up" ? L("TCP port open", "TCP-порт доступен")
+            : up == "down" ? L("TCP port closed", "TCP-порт недоступен") : L("checking the TCP port", "проверяю TCP-порт")
     }
 
     private func exitStatus(_ s: [String: String]) -> Hop.Status {
@@ -253,7 +257,9 @@ struct MenuView: View {
             let age = Int(Date().timeIntervalSince1970 - (TimeInterval(s["egress_at"] ?? "") ?? 0))
             parts.append(age < 120 ? L("verified \(age)s ago", "проверен \(age) с назад")
                                    : L("verified \(age / 60)m ago", "проверен \(age / 60) мин назад"))
-        } else if let ip = s["egress_ip"], !ip.isEmpty, ip != expected {
+        } else if s["egress_check"] == "no_answer" {
+            parts.append(L("no answer through the tunnel", "нет ответа через туннель"))
+        } else if s["egress_check"] == nil, let ip = s["egress_ip"], !ip.isEmpty, ip != expected {
             parts.append(L("seen \(ip): wrong exit", "виден \(ip): чужой выход"))
         } else {
             parts.append(L("verifying…", "проверяю…"))

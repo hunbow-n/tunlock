@@ -15,6 +15,8 @@ case $verdict in
 esac
 echo "---"
 echo "Status: ${verdict:-unknown}"
+reason=$(get reason)
+[[ -z $reason || $reason == ok || $reason == off ]] || echo "Reason: $reason"
 echo "SSH: $(get ssh) $(get ssh_endpoint)"
 ok=$( [[ $(get egress_ok) == 1 ]] && echo verified || echo "not verified")
 echo "Egress: $(get egress_ip) ($ok, expected $(get expected))"

@@ -79,7 +79,7 @@ enum MCPServer {
 
     static let tools: [[String: Any]] = [
         ["name": "status",
-         "description": "Tunlock's current state: on/off, verdict (protected, blocked, off…), exit IP and country, SSH or proxy, firewall phase. Read-only.",
+         "description": "Tunlock's current state: on/off, verdict (protected, blocked, off…), reason (why it is blocked or unprotected: no_tun, entry_down, ssh_down, exit_mismatch, exit_no_answer, exit_pending, pf_*, sleep, stale, unknown), exit IP and country, SSH or proxy (entry_up is only a TCP port check), firewall phase. Read-only.",
          "inputSchema": schema([:])],
         ["name": "detect",
          "description": "What is on this Mac, without any network request: utun interfaces with IPv4 (TUN apps), VPN service names, the local network, and the setup-relevant fields of the installed Tunlock config. Read-only.",
