@@ -1,6 +1,6 @@
 #!/bin/bash
 # Creates the Ed25519 key that signs release checksums (run once, by the owner).
-#   private key -> paste into GitHub: Settings > Secrets > Actions > TUNLOCK_RELEASE_KEY
+#   private key -> GitHub: Settings > Environments > release > secret TUNLOCK_RELEASE_KEY
 #   public key  -> docs/tunlock-release.pem, committed, used by everyone to verify
 set -euo pipefail
 cd "$(dirname "$0")/.."
