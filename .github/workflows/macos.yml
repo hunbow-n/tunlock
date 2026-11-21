@@ -126,21 +126,13 @@ jobs:
           hdiutil create -volname Tunlock -srcfolder build/dmg -format UDZO build/Tunlock.dmg
           hdiutil verify build/Tunlock.dmg
 
-      - name: Checksums (signed when the release key is set)
-        env:
-          RELEASE_KEY: ${{ secrets.TUNLOCK_RELEASE_KEY }}
+      # Signed later, in the release job: this job also runs for pull requests,
+      # and a pull request must never reach the release key.
+      - name: Checksums
         run: |
           cd build
           shasum -a 256 Tunlock.dmg > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          if [ -n "$RELEASE_KEY" ]; then
-            OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
-            printf '%s\n' "$RELEASE_KEY" > release.key
-            "$OPENSSL" pkeyutl -sign -inkey release.key -rawin -in SHA256SUMS.txt | base64 > SHA256SUMS.txt.sig
-            rm -f release.key
-            "$OPENSSL" pkeyutl -verify -pubin -inkey ../docs/tunlock-release.pem -rawin -in SHA256SUMS.txt \
-              -sigfile <(base64 -d < SHA256SUMS.txt.sig)
-          fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -148,7 +140,6 @@ jobs:
           path: |
             build/Tunlock.dmg
             build/SHA256SUMS.txt
-            build/SHA256SUMS.txt.sig
             build/release-notes.md
           if-no-files-found: error
 
@@ -169,12 +160,43 @@ jobs:
     needs: [build, pf-live]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.release_tag != ''
     runs-on: ubuntu-latest
+    # The release key is a secret of this environment, which only main may use
+    # (Settings > Environments > release > Deployment branches: main).
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          path: src
+          sparse-checkout: docs/tunlock-release.pem
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: Tunlock-macOS
+      - name: Sign checksums (when the release key is set)
+        shell: bash
+        env:
+          RELEASE_KEY: ${{ secrets.TUNLOCK_RELEASE_KEY }}
+        run: |
+          sha256sum --check SHA256SUMS.txt
+          if [[ -z "$RELEASE_KEY" ]]; then
+            echo "No release key: SHA256SUMS.txt stays unsigned."
+            exit 0
+          fi
+          pem=src/docs/tunlock-release.pem
+          if [[ ! -f "$pem" ]]; then
+            echo "TUNLOCK_RELEASE_KEY is set, but docs/tunlock-release.pem is not committed." >&2
+            exit 1
+          fi
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$RELEASE_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in SHA256SUMS.txt | base64 -w0 > SHA256SUMS.txt.sig
+          echo >> SHA256SUMS.txt.sig
+          openssl pkeyutl -verify -pubin -inkey "$pem" -rawin -in SHA256SUMS.txt \
+            -sigfile <(base64 -d < SHA256SUMS.txt.sig)
       - name: Publish GitHub Release
         shell: bash
         env:

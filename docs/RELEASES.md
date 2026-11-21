@@ -14,7 +14,8 @@ job to resume the release for that commit.
 Every DMG is built on GitHub Actions, never on someone's computer. The build
 publishes `SHA256SUMS.txt` next to the DMG. Once the owner has set a release key,
 it also publishes `SHA256SUMS.txt.sig`, an Ed25519 signature made with a private
-key that only exists as a GitHub secret.
+key that only exists as a secret of the `release` environment. Only the release
+job on `main` can read it; builds for pull requests never sign.
 
 Check the file you downloaded (OpenSSL 3: `brew install openssl@3`):
 
@@ -27,8 +28,10 @@ shasum -a 256 -c SHA256SUMS.txt
 ```
 
 Both commands must succeed: `Signature Verified Successfully` and `Tunlock.dmg: OK`.
-A changed DMG fails the checksum; a changed checksum file fails the signature,
-even if someone took over the GitHub account, because the private key is not in it.
+A changed DMG fails the checksum; a changed checksum file fails the signature.
+The key is never in the repository or on the release page, so replacing files
+there is caught. It does sign whatever the release job on `main` builds: whoever
+can push to `main` or approve the `release` environment can get a build signed.
 
 ## For the owner: set up the key once
 
@@ -36,6 +39,10 @@ even if someone took over the GitHub account, because the private key is not in 
 tools/release-key.sh      # writes docs/tunlock-release.pem, prints the private key
 ```
 
-Paste the private key into GitHub: Settings → Secrets and variables → Actions →
-New repository secret `TUNLOCK_RELEASE_KEY`. Commit `docs/tunlock-release.pem`.
+In GitHub: Settings → Environments → `release` (create it if the first release
+run has not). Under Deployment branches and tags choose Selected branches and add
+`main`; optionally add yourself under Required reviewers to approve each release.
+Add the private key there as an environment secret `TUNLOCK_RELEASE_KEY`, not as a
+repository secret: a repository secret reaches every workflow run, pull requests
+from branches of this repository included. Commit `docs/tunlock-release.pem`.
 Without the secret, CI still publishes `SHA256SUMS.txt`, just unsigned.
