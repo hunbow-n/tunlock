@@ -101,7 +101,8 @@ final class StatusModel: ObservableObject {
     @Published var message: String?
     @Published var testOutput: String?
     /// Set when off was asked while AI clients run, or when that could not be checked.
-    @Published var offPrompt: OffPrompt?
+    @Published private(set) var offPrompt: OffPrompt?
+    private var checkingOff = false
     /// AI clients running now (display names), checked every few seconds.
     @Published private(set) var aiClients: [String] = []
     private var aiCheckedAt = Date.distantPast
@@ -135,6 +136,7 @@ final class StatusModel: ObservableObject {
             }
         }
         state = s
+        if mode != "protected", offPrompt != nil { cancelOff() }
         let updated = TimeInterval(s["updated"] ?? "") ?? 0
         stale = Date().timeIntervalSince1970 - updated > 10
         // Tunnel traffic when there is a tunnel, otherwise the main connection.
@@ -222,22 +224,27 @@ final class StatusModel: ObservableObject {
     }
 
     private func askOff() async {
+        guard mode == "protected", busy == nil, offPrompt == nil, !checkingOff else { return }
+        checkingOff = true
+        defer { checkingOff = false }
+        let result = await runningAIProcesses()
+        guard mode == "protected", busy == nil else { return }
         // A failed check is not "none running": the user decides.
-        guard let processes = await runningAIProcesses() else { offPrompt = .checkFailed; return }
+        guard let processes = result else { offPrompt = .checkFailed; return }
         aiClients = aiDisplayNames(processes)
         if processes.isEmpty { turnOff(confirmed: []) } else { offPrompt = .clients(processes) }
     }
 
+    func cancelOff() { offPrompt = nil }
+
     /// Turns off after the AI clients warning was confirmed.
     func turnOffAnyway() {
-        let confirmed: [String]
-        switch offPrompt {
-        case .clients(let processes): confirmed = processes
-        case .checkFailed: confirmed = ["?"]
-        case nil: confirmed = []
+        guard let prompt = offPrompt, mode == "protected", busy == nil else { return }
+        cancelOff()
+        switch prompt {
+        case .clients(let processes): turnOff(confirmed: processes)
+        case .checkFailed: turnOff(confirmed: ["?"])
         }
-        offPrompt = nil
-        turnOff(confirmed: confirmed)
     }
 
     /// The password prompt may wait for minutes: the CLI checks the clients

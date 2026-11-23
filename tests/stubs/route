@@ -1,7 +1,18 @@
 #!/bin/bash
 # One kernel route for every exception address: $STUB/kernel_route "iface gw".
+if [[ $2 == -v && $3 == get ]]; then
+  read -r i g < "$STUB/kernel_route"
+  echo "  interface: $i"
+  [[ -z $g ]] || echo "    gateway: $g"
+  if [[ -s $STUB/route_source ]]; then
+    echo "sockaddrs: <DST,GATEWAY,NETMASK,IFP,IFA>"
+    echo " 192.168.0.0 $g 255.255.255.0 index: 14 $i:aa.bb.cc.dd.ee.ff $(cat "$STUB/route_source")"
+  fi
+  exit 0
+fi
 case $2 in
   get) read -r i g < "$STUB/kernel_route"; echo "  interface: $i"; [[ -z $g ]] || echo "    gateway: $g" ;;
-  add) echo "en0 $5" > "$STUB/kernel_route"; echo "add $4 $5 ${*:6}" >> "$STUB/route.log" ;;
+  change) echo "${9}" > "$STUB/route_source"; echo "change $4 $5 ${*:6}" >> "$STUB/route.log" ;;
+  add) echo "en0 $5" > "$STUB/kernel_route"; echo "${9}" > "$STUB/route_source"; echo "add $4 $5 ${*:6}" >> "$STUB/route.log" ;;
   delete) echo "delete $4 $5" >> "$STUB/route.log" ;;
 esac

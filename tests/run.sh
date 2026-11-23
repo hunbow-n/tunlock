@@ -312,12 +312,13 @@ expect_eq "routes: a working route is left alone" "$([[ -e $STUB/route.log ]] &&
 rm -rf "$STUB" "$hook"
 
 guard_setup
-echo "192.168.0.0/24 192.168.1.1 en0 192.168.1.45" > "$STUB/run/routes"
+echo "192.168.0.0/24 192.168.1.1 en0 192.168.1.208" > "$STUB/run/routes"
+echo "192.168.1.45" > "$STUB/route_source"
 echo "192.168.1.208" > "$STUB/physical_ipv4"
 gt 2
-expect_eq "routes: same gateway with a new interface address is rebound once" \
-  "$(cat "$STUB/route.log")" $'delete 192.168.0.0/24 192.168.1.1\nadd 192.168.0.0/24 192.168.1.1 -ifp en0 -ifa 192.168.1.208'
-expect_eq "routes: records the new source address" "$(cat "$STUB/run/routes")" "192.168.0.0/24 192.168.1.1 en0 192.168.1.208"
+expect_eq "routes: stale kernel source is rebound once despite a current record" \
+  "$(cat "$STUB/route.log")" 'change 192.168.0.0/24 192.168.1.1 -ifp en0 -ifa 192.168.1.208'
+expect_eq "routes: kernel uses the current source address" "$(cat "$STUB/route_source")" "192.168.1.208"
 rm -rf "$STUB"
 
 # ---- protect/direct: success only when the guard answers this very request
@@ -374,8 +375,13 @@ ack_off() { # ack contents, path dir: exit code, mode written, ack left or used
   echo "$rc $(cat "$STUB/db/mode" 2>/dev/null || echo unchanged) $([[ -e $STUB/ack ]] && echo left || echo used)"
   rm -rf "$STUB"
 }
-expect_eq "off: a client started after the app's confirmation keeps protection on" "$(ack_off "")" "1 unchanged used"
-expect_eq "off: clients the user confirmed in the app do not stop it" "$(ack_off "bash")" "0 direct used"
+psok=$(mktemp -d)
+cp "$STUBS"/* "$psok/"
+printf '#!/bin/bash\nprintf "%%s\\n" /bin/bash\n' > "$psok/ps"
+chmod +x "$psok/ps"
+expect_eq "off: a client started after the app's confirmation keeps protection on" "$(ack_off "" "$psok")" "1 unchanged used"
+expect_eq "off: clients the user confirmed in the app do not stop it" "$(ack_off "bash" "$psok")" "0 direct used"
+rm -rf "$psok"
 psfail=$(mktemp -d); cp "$STUBS"/* "$psfail/"; printf '#!/bin/bash\nexit 1\n' > "$psfail/ps"; chmod +x "$psfail/ps"
 expect_eq "off: a failed recheck keeps protection on" "$(ack_off "bash" "$psfail")" "1 unchanged used"
 expect_eq "off: a failed recheck passes when the user confirmed a failed check" "$(ack_off "?" "$psfail")" "0 direct used"

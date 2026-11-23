@@ -26,6 +26,7 @@ struct MenuView: View {
                 .buttonStyle(.borderedProminent)
             } else {
                 modeSwitch
+                if let prompt = model.offPrompt { offConfirmation(prompt) }
                 if !model.aiClients.isEmpty { aiClientsLine }
                 card { route(v) }
                 card { traffic }
@@ -157,19 +158,35 @@ struct MenuView: View {
             Toggle("", isOn: Binding(get: { on }, set: { model.setMode($0) }))
                 .toggleStyle(PowerSwitchStyle(busy: model.busy != nil))
                 .labelsHidden()
-                .disabled(model.busy != nil)
-                .confirmationDialog(model.offPrompt == .checkFailed ? L("Could not check AI apps", "Не удалось проверить AI-приложения")
-                                                                    : L("AI apps are still running", "AI-приложения ещё запущены"),
-                                    isPresented: Binding(get: { model.offPrompt != nil },
-                                                         set: { if !$0 { model.offPrompt = nil } })) {
-                    Button(L("Turn off anyway", "Всё равно выключить"), role: .destructive) { model.turnOffAnyway() }
-                    Button(L("Keep on", "Оставить включённым"), role: .cancel) { model.offPrompt = nil }
-                } message: {
-                    Text(model.offPrompt?.message ?? "")
-                }
+                .disabled(model.busy != nil || model.offPrompt != nil)
         }
         .padding(Shape.cardPadding)
         .background(Shape.card().fill((on ? Color.green : Color.primary).opacity(on ? 0.12 : 0.05)))
+    }
+
+    /// Keep the confirmation inside the status panel so it can receive clicks.
+    private func offConfirmation(_ prompt: OffPrompt) -> some View {
+        card {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(prompt == .checkFailed ? L("Could not check AI apps", "Не удалось проверить AI-приложения")
+                     : L("AI apps are still running", "AI-приложения ещё запущены"))
+                    .font(.headline)
+                Text(prompt.message)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    model.cancelOff()
+                } label: {
+                    Text(L("Keep on", "Оставить включённым")).frame(maxWidth: .infinity)
+                }
+                Button(role: .destructive) {
+                    model.turnOffAnyway()
+                } label: {
+                    Text(L("Turn off anyway", "Всё равно выключить")).frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.bordered)
+        }
     }
 
     /// Which AI apps are running and what happens to their traffic now: from

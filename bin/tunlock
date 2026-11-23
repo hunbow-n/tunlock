@@ -490,10 +490,17 @@ bypass_targets() {
   for item in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do echo "$item/32"; done
 }
 
-# "interface gateway" of the route the kernel uses right now (gateway is
-# empty for a directly connected network).
+# The last sockaddr in a route reply is the interface address when IFA
+# is present. Ignore the socket request printed before the reply.
 route_info() {
-  route -n get "$1" 2>/dev/null | awk '/interface:/ { i = $2 } /gateway:/ { g = $2 } END { print i, g }'
+  route -n -v get "$1" 2>/dev/null | awk '
+    $1 == "interface:" { iface = $2 }
+    $1 == "gateway:" { gateway = $2 }
+    $1 == "sockaddrs:" && $0 ~ /[<,]IFA>/ {
+      if (getline > 0) source = $NF
+    }
+    END { print iface, gateway, source }
+  '
 }
 
 # A TUN client in global mode owns the default route. Exception networks need
@@ -502,7 +509,7 @@ route_info() {
 # when the gateway address stayed the same. Routes added here are recorded in
 # $RUN_DIR/routes and are the only ones ever removed.
 sync_bypass_routes() {
-  local phys gw src net rec rec_if rec_src keep='' cur_if cur_gw
+  local phys gw src net rec keep='' cur_if cur_gw cur_src
   phys=$(physical_iface)
   gw=$(physical_gateway)
   src=''
@@ -514,14 +521,20 @@ sync_bypass_routes() {
     [[ $keep != *" $net "* ]] || continue
     keep="$keep $net "
     [[ -n $phys && $gw =~ ^[0-9.]+$ && $src =~ ^[0-9.]+$ ]] || continue
-    read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
-    read -r rec rec_if rec_src <<< "$(awk -v n="$net" '$1 == n { print $2, $3, $4; exit }' "$RUN_DIR/routes")"
+    read -r cur_if cur_gw cur_src <<< "$(route_info "$(net_probe_ip "$net")")"
+    rec=$(awk -v n="$net" '$1 == n { print $2; exit }' "$RUN_DIR/routes")
     if [[ $cur_if == "$phys" && ( -z $cur_gw || $cur_gw == "$gw" || $cur_gw == link#* ) ]]; then
-      # Two Wi-Fi networks can share the same gateway address. Rebind only
-      # our route when the interface or its IPv4 address changes.
-      if [[ -z $rec || $cur_gw != "$rec" || ( $rec_if == "$phys" && $rec_src == "$src" ) ]]; then
-        continue
+      # A recorded source can disagree with the kernel even on the same
+      # interface and gateway. Change only a route that Tunlock recorded.
+      [[ -n $rec && $cur_gw == "$rec" && $cur_src != "$src" ]] || continue
+      if route_op change "$net" "$gw" -ifp "$phys" -ifa "$src" >/dev/null 2>&1; then
+        route_forget "$net"
+        echo "$net $gw $phys $src" >> "$RUN_DIR/routes"
+        log "exception rebound: $net via $gw ($phys, $src)"
+      else
+        G_WARNING="could not refresh the exception route for $net"
       fi
+      continue
     fi
     if [[ -n $rec ]]; then
       if ! route_op delete "$net" "$rec" >/dev/null 2>&1 && [[ $cur_if == "$phys" && $cur_gw == "$rec" ]]; then

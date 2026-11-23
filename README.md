@@ -108,7 +108,8 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
    service Tunlock starts and stops.
 4. Press **Save and apply**. One administrator prompt installs the background
    service. With **Switch modes without a password** checked, it never asks again.
-5. Flip the switch in the menu bar.
+5. Flip the switch in the menu bar. If AI apps are still running when you
+   switch off, confirm or cancel in the Tunlock panel.
 
 <p align="center">
   <img src="docs/screenshots/en-light-exit.png" width="270" alt="Exit tab: pin by IP, country or both">
