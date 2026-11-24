@@ -207,7 +207,7 @@ The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
 | `SSH_FORWARD` | what SSH forwards: `-L …` to a proxy on the server, or `-D` for SOCKS |
 | `JUMP_HOST`, `JUMP_USER`, `JUMP_PORT` | optional relay: SSH enters here and reaches `VPS_IP` from there |
 | `TUN_ADDR`, `TUN_MASK` | IPv4 of your TUN app's interface; the utun number may change |
-| `TUN_SERVICE` | VPN name from `scutil --nc list` (e.g. `Karing`) to start and stop with Tunlock |
+| `TUN_SERVICE` | VPN name from `scutil --nc list` (e.g. `Karing`) to start and stop with Tunlock. When an update of the TUN app registers the VPN under a new name and the configured service can no longer start, Tunlock controls the new one: only a single `<name> (…)` service of the same app, chosen by its UUID |
 | `BYPASS_NETS`, `BYPASS_DNS` | exceptions: networks reached directly, and DNS servers per domain |
 | `EXPECTED_EGRESS` | the pinned exit IP, or `any` to accept any IP (then a country is required) |
 | `EXPECTED_COUNTRY` | two-letter country the exit must be in, e.g. `US`; optional with a pinned IP |
@@ -215,6 +215,14 @@ The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
 
 All addresses are IPv4 literals: DNS is blocked outside the tunnel, so names
 could not be resolved to reconnect.
+
+The SSH forward is kept up by a background job. After a dropped connection the
+next attempt waits a little longer each time (up to a minute), so an entry that
+blinks or rate limits new connections is not hit by a retry storm. The guard
+starts the TUN app once the forward (or, with a proxy, the proxy port) is up,
+and again if the TUN app gave up while it was down: only behind confirmed
+firewall rules, at most three tries a minute apart each time the forward comes
+back. A TUN app you stop yourself after its tunnel was up stays stopped.
 
 <details>
 <summary><b>Example: Karing + Outline (Shadowsocks) behind SSH</b></summary>

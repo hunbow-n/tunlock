@@ -1,3 +1,12 @@
 #!/bin/bash
-# Records VPN service control.
+# Records VPN service control. Answers --nc list and --nc show from fixtures
+# when the test sets them; lookups are not control, so they stay out of the log.
+if [[ ${1-} == --nc && ${2-} == list ]]; then
+  [[ -n ${STUB_NC_LIST:-} ]] && cat "$STUB_NC_LIST"
+  exit 0
+fi
+if [[ ${1-} == --nc && ${2-} == show ]]; then
+  [[ -n ${STUB_NC_SHOW_DIR:-} ]] && cat "$STUB_NC_SHOW_DIR/${3-}" 2>/dev/null
+  exit 0
+fi
 echo "$*" >> "$STUB/scutil.log"

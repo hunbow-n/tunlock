@@ -1,12 +1,17 @@
 #!/bin/bash
 # One kernel route for every exception address: $STUB/kernel_route "iface gw".
+# Its source address: $STUB/route_source for the exact route (get -net/-host),
+# $STUB/probe_route_source (if set) for an address inside it, as when the
+# address follows a host route cloned before the source changed.
 if [[ $2 == -v && $3 == get ]]; then
   read -r i g < "$STUB/kernel_route"
   echo "  interface: $i"
   [[ -z $g ]] || echo "    gateway: $g"
-  if [[ -s $STUB/route_source ]]; then
+  src=$STUB/route_source
+  [[ $4 == -net || $4 == -host || ! -e $STUB/probe_route_source ]] || src=$STUB/probe_route_source
+  if [[ -s $src ]]; then
     echo "sockaddrs: <DST,GATEWAY,NETMASK,IFP,IFA>"
-    echo " 192.168.0.0 $g 255.255.255.0 index: 14 $i:aa.bb.cc.dd.ee.ff $(cat "$STUB/route_source")"
+    echo " 192.168.0.0 $g 255.255.255.0 index: 14 $i:aa.bb.cc.dd.ee.ff $(cat "$src")"
   fi
   exit 0
 fi

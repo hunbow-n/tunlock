@@ -320,6 +320,21 @@ expect_eq "routes: stale kernel source is rebound once despite a current record"
   "$(cat "$STUB/route.log")" 'change 192.168.0.0/24 192.168.1.1 -ifp en0 -ifa 192.168.1.208'
 expect_eq "routes: kernel uses the current source address" "$(cat "$STUB/route_source")" "192.168.1.208"
 rm -rf "$STUB"
+guard_setup
+echo "192.168.0.0/24 192.168.1.1 en0 192.168.1.208" > "$STUB/run/routes"
+echo "192.168.1.45" > "$STUB/route_source"; echo "192.168.1.45" > "$STUB/probe_route_source"
+echo "192.168.1.208" > "$STUB/physical_ipv4"
+gt 4
+expect_eq "routes: a stale cloned host route does not trigger a change every tick" \
+  "$(grep -c '^change' "$STUB/route.log")" "1"
+rm -rf "$STUB"
+guard_setup
+echo "192.168.0.0/24 192.168.1.1 en0 192.168.1.208" > "$STUB/run/routes"
+echo "192.168.1.208" > "$STUB/physical_ipv4"
+gt 2
+expect_eq "routes: an unknown kernel source is never a reason to change" \
+  "$([[ -e $STUB/route.log ]] && cat "$STUB/route.log")" ""
+rm -rf "$STUB"
 
 # ---- protect/direct: success only when the guard answers this very request
 # fake_guard mode phase pf_enabled [error] [answer=1]: a background responder
@@ -327,14 +342,14 @@ rm -rf "$STUB"
 fake_guard() {
   STUB=$(mktemp -d); mkdir -p "$STUB/db" "$STUB/run"
   # A fresh-looking snapshot from before the command: must never count.
-  printf 'updated=%s\nack=old\nmode=%s\nphase=%s\npf_enabled=%s\npf_rules=7\npf_reachable=1\nerror=%s\n' \
-    "$(date +%s)" "$1" "$2" "$3" "${4:-}" > "$STUB/run/state"
+  printf 'updated=%s\nack=old\nmode=%s\nphase=%s\npf_enabled=%s\npf_rules=7\npf_reachable=1\nssh=%s\nerror=%s\n' \
+    "$(date +%s)" "$1" "$2" "$3" "${FAKE_SSH:-up}" "${4:-}" > "$STUB/run/state"
   [[ ${5:-1} == 1 ]] || return 0
   (
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       if [[ -s $STUB/db/request ]]; then
-        printf 'updated=%s\nack=%s\nmode=%s\nphase=%s\npf_enabled=%s\npf_rules=7\npf_reachable=1\nerror=%s\n' \
-          "$(date +%s)" "$(cat "$STUB/db/request")" "$(cat "$STUB/db/mode")" "$2" "$3" "${4:-}" > "$STUB/run/state"
+        printf 'updated=%s\nack=%s\nmode=%s\nphase=%s\npf_enabled=%s\npf_rules=7\npf_reachable=1\nssh=%s\nerror=%s\n' \
+          "$(date +%s)" "$(cat "$STUB/db/request")" "$(cat "$STUB/db/mode")" "$2" "$3" "${FAKE_SSH:-up}" "${4:-}" > "$STUB/run/state"
         exit 0
       fi
       sleep 0.3
@@ -387,10 +402,19 @@ expect_eq "off: a failed recheck keeps protection on" "$(ack_off "bash" "$psfail
 expect_eq "off: a failed recheck passes when the user confirmed a failed check" "$(ack_off "?" "$psfail")" "0 direct used"
 rm -rf "$psfail"
 # on/off drive the TUN client and the SSH keeper, after the guard confirms
-svc_conf=$(mktemp); { cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; } > "$svc_conf"
+# With a proxy upstream "on" starts the TUN client itself (with SSH the guard does)
+svc_conf=$(mktemp); printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\nTUN_SERVICE=Karing\n' > "$svc_conf"
 clis() { export STUB; TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$svc_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T "$@" >/dev/null 2>&1; echo $?; }
 fake_guard protected open 1
-expect_eq "on: TUN client started after the rules are confirmed" "$(clis on) | $(cat "$STUB/scutil.log")" "0 | --nc start Karing"; done_guard
+expect_eq "on: the CLI never starts the TUN client itself, the guard does" "$(clis on) | $(cat "$STUB/scutil.log" 2>/dev/null)" "0 | "; done_guard
+ssh_svc_conf=$(mktemp); { cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; } > "$ssh_svc_conf"
+fake_guard protected open 1
+expect_eq "on: with SSH the start is left to the guard, never done by the CLI" \
+  "$(TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$ssh_svc_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T on >/dev/null 2>&1; echo $?) | $(cat "$STUB/scutil.log" 2>/dev/null)" "0 | "; done_guard
+fake_guard protected open 1
+expect_eq "off: with SSH stops the TUN client too" \
+  "$(echo direct > "$STUB/db/mode"; TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$ssh_svc_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T off >/dev/null 2>&1; echo $?) | $(cat "$STUB/scutil.log" 2>/dev/null)" "0 | --nc stop Karing"; done_guard
+rm -f "$ssh_svc_conf"
 fake_guard protected open 0
 expect_eq "on: TUN client NOT started when protection is not confirmed" "$(clis on) | $(cat "$STUB/scutil.log" 2>/dev/null)" "1 | "; done_guard
 fake_guard direct direct 1
@@ -400,6 +424,101 @@ fake_guard protected open 1 "" 0
 expect_eq "off: nothing is stopped while direct is not confirmed" \
   "$(clis off) | $([[ -e $STUB/scutil.log || -e $STUB/launchctl.log ]] && echo touched || echo untouched)" "1 | untouched"; done_guard
 rm -f "$svc_conf"
+
+# ---- a TUN client update may orphan the configured service: control the live one
+svc2_conf=$(mktemp); printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\nTUN_SERVICE=Karing\n' > "$svc2_conf"
+clis2() { export STUB; TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$svc2_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T "$@" >/dev/null 2>&1; echo $?; }
+export STUB_NC_LIST=$F/nc-list.karing.txt STUB_NC_SHOW_DIR=$F/nc-show STUB_SYSEXT=$F/sysext.karing.txt
+fake_guard protected open 1
+expect_eq "off: an orphaned service is replaced by its live rename" \
+  "$(clis2 off) | $(tail -1 "$STUB/scutil.log")" "0 | --nc stop 00000000-0000-4000-8000-000000000001"; done_guard
+fake_guard protected open 1
+expect_eq "off: stops the same live service" \
+  "$(clis2 off) | $(tail -1 "$STUB/scutil.log")" "0 | --nc stop 00000000-0000-4000-8000-000000000001"; done_guard
+export STUB_SYSEXT=$F/sysext.both.txt
+fake_guard protected open 1
+expect_eq "off: the configured service wins while its provider is live" \
+  "$(clis2 off) | $(tail -1 "$STUB/scutil.log")" "0 | --nc stop 00000000-0000-4000-8000-000000000002"; done_guard
+export STUB_NC_LIST=$F/nc-list.other.txt
+fake_guard protected open 1
+expect_eq "off: a configured service that is gone is not swapped for another" \
+  "$(clis2 off) | $(cat "$STUB/scutil.log" 2>/dev/null)" "0 | --nc stop Karing"; done_guard
+export STUB_NC_LIST=$F/nc-list.ambiguous.txt STUB_SYSEXT=$F/sysext.karing.txt
+fake_guard protected open 1
+expect_eq "off: without the old service a lookalike is never taken" \
+  "$(clis2 off) | $(cat "$STUB/scutil.log" 2>/dev/null)" "0 | --nc stop Karing"; done_guard
+export STUB_NC_LIST=$F/nc-list.otherapp.txt
+fake_guard protected open 1
+expect_eq "off: a lookalike name from another app is never taken" \
+  "$(clis2 off) | $(tail -1 "$STUB/scutil.log")" "0 | --nc stop 00000000-0000-4000-8000-000000000002"; done_guard
+unset STUB_NC_LIST STUB_NC_SHOW_DIR STUB_SYSEXT
+rm -f "$svc2_conf"
+
+# Proxy upstream: no SSH forward to wait for, the client starts right away
+pxs_conf=$(mktemp); printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.20.0.1\nTUN_MASK=0xfffffffc\nTUN_SERVICE=Karing\n' > "$pxs_conf"
+FAKE_SSH=none fake_guard protected open 1
+expect_eq "on: with a proxy upstream the CLI does not wait for SSH and leaves the start to the guard" \
+  "$(TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$pxs_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T on 2>&1 | grep -c 'once the proxy port answers') | $(cat "$STUB/scutil.log" 2>/dev/null)" "1 | "; done_guard
+rm -f "$pxs_conf"
+
+# ---- the guard restarts a TUN client that gave up while the forward was down
+guard_setup
+{ cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; echo 'TUN_ADDR=10.99.0.1'; echo PROBE_INTERVAL=5; } > "$STUB/conf"
+export STUB_NC_LIST=$F/nc-list.karing.txt STUB_NC_SHOW_DIR=$F/nc-show STUB_SYSEXT=$F/sysext.karing.txt
+gt 2
+expect_eq "guard: starts the TUN client once the forward is up and no tunnel is" \
+  "$(st phase) | $(grep -c 'nc start 00000000-0000-4000-8000-000000000001' "$STUB/scutil.log" 2>/dev/null)" "block | 1"
+unset STUB_NC_LIST STUB_NC_SHOW_DIR STUB_SYSEXT
+rm -rf "$STUB"
+svc_guard() { # extra conf lines; then gt args
+  guard_setup; { cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; echo PROBE_INTERVAL=5; printf '%b' "$1"; } > "$STUB/conf"; shift
+  gt "$@"
+}
+svc_guard 'TUN_ADDR=10.99.0.1\n' 3
+expect_eq "guard: one start per minute, not one per tick" "$(grep -c 'nc start' "$STUB/scutil.log")" "1"; rm -rf "$STUB"
+guard_setup; : > "$STUB/pf_fail"; rm -f "$STUB/egress"
+{ cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; echo 'TUN_ADDR=10.99.0.1'; } > "$STUB/conf"; gt 2
+expect_eq "guard: never starts the TUN client while pf rules are not confirmed" \
+  "$([[ -e $STUB/scutil.log ]] && cat "$STUB/scutil.log")" ""; rm -rf "$STUB"
+guard_setup; printf 'pass out quick all\nanchor "com.apple/*" all\n' > "$STUB/root_rules"
+{ cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; echo 'TUN_ADDR=10.99.0.1'; } > "$STUB/conf"; gt 2
+expect_eq "guard: never starts the TUN client while other pf rules decide first" \
+  "$([[ -e $STUB/scutil.log ]] && cat "$STUB/scutil.log") | $(grep -c 'pf protection is not confirmed' "$STUB/guard.log")" " | 1"; rm -rf "$STUB"
+export STUB_NC_LIST=$F/nc-list.ambiguous.txt
+svc_guard 'TUN_ADDR=10.99.0.1\n' 1
+expect_eq "guard: a configured TUN app that is gone shows a warning, nothing is started" \
+  "$([[ -e $STUB/scutil.log ]] && cat "$STUB/scutil.log") | $(st warning | grep -c 'no longer exists (found: Karing (system) Karing (beta))')" " | 1"
+unset STUB_NC_LIST; rm -rf "$STUB"
+printf '#!/bin/bash\n[[ $1 == 0 ]] && sed -i "" s/^utun7:/utunX:/ "$STUB/ifconfig.txt"\nexit 0\n' > "$hook"; chmod +x "$hook"
+svc_guard '' 3 "$hook"
+expect_eq "guard: a client stopped after its tunnel was up is not started again" \
+  "$([[ -e $STUB/scutil.log ]] && cat "$STUB/scutil.log") | $(st tun)" " | "; rm -rf "$STUB"
+svc_guard 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8080\nTUN_ADDR=10.99.0.1\n' 2
+expect_eq "guard: with a proxy upstream it starts the client once the proxy port answers" \
+  "$(grep -c 'nc start' "$STUB/scutil.log" 2>/dev/null)" "1"; rm -rf "$STUB"
+
+# A failing "scutil --nc list" must not end the guard
+nc_fail=$(mktemp -d); cp "$STUBS"/* "$nc_fail/"
+printf '#!/bin/bash\n[[ $1 == --nc && $2 == list ]] && exit 1\necho "$*" >> "$STUB/scutil.log"\n' > "$nc_fail/scutil"; chmod +x "$nc_fail/scutil"
+guard_setup; { cat "$F/good.conf"; echo 'TUN_SERVICE="Karing"'; echo 'TUN_ADDR=10.99.0.1'; } > "$STUB/conf"
+TUNLOCK_TEST_PATH=$nc_fail TUNLOCK_CONF=$STUB/conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
+  TUNLOCK_RESOLVER_DIR=$STUB/resolver TUNLOCK_TEST_IFCONFIG=$STUB/ifconfig.txt $T _guard-ticks 2 > "$STUB/guard.log" 2>&1; rc=$?
+expect_eq "guard: a failed VPN service listing is retried, the guard keeps running" "$rc $(st phase)" "0 block"
+rm -rf "$STUB" "$nc_fail"
+
+# The SSH keeper backs off between failed attempts instead of exiting
+ssh_stubs=$(mktemp -d); cp "$STUBS"/* "$ssh_stubs/"
+# ssh records the -B interface; the second attempt finds Ethernet instead of Wi-Fi
+printf '#!/bin/bash\nwhile (( $# )); do [[ $1 == -B ]] && echo "$2" >> "$STUB/ssh.log"; shift; done\necho en7 > "$STUB/phys"\n(( $(wc -l < "$STUB/ssh.log") >= 3 )) && echo direct > "$STUB/db/mode"\nexit 255\n' > "$ssh_stubs/ssh"
+printf '#!/bin/bash\necho "$*" >> "$STUB/sleep.log"\n' > "$ssh_stubs/sleep"
+printf '#!/bin/bash\nexit 0\n' > "$ssh_stubs/ssh-add"
+printf '#!/bin/bash\necho "default 192.168.1.1 UGScg $(cat "$STUB/phys")"\n' > "$ssh_stubs/netstat"
+chmod +x "$ssh_stubs"/*
+STUB=$(mktemp -d); export STUB; mkdir -p "$STUB/db" "$STUB/run"; echo protected > "$STUB/db/mode"; echo en0 > "$STUB/phys"
+TUNLOCK_TEST_PATH=$ssh_stubs TUNLOCK_CONF=$F/good.conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T ssh-run > "$STUB/out" 2>&1; rc=$?
+expect_eq "ssh-run: failed attempts wait longer each time, and stop once off" \
+  "$rc $(paste -sd' ' "$STUB/ssh.log") $(paste -sd' ' "$STUB/sleep.log")" "0 en0 en7 en7 10 15"
+rm -rf "$STUB" "$ssh_stubs"
 
 STUB=$(mktemp -d); mkdir -p "$STUB/db" "$STUB/run"
 expect_eq "protect fails without any guard state" "$(cli protect)" "1"; rm -rf "$STUB"

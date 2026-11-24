@@ -1,0 +1,2 @@
+* (Disconnected)   00000000-0000-4000-8000-000000000001 VPN (com.example.karing) "Karing (system)"                [VPN:com.example.karing]
+* (Disconnected)   00000000-0000-4000-8000-000000000002 VPN (com.example.karing) "Karing"                         [VPN:com.example.karing]

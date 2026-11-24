@@ -1,0 +1,2 @@
+*       *       TESTTEAM01      com.example.karing.karingServiceSE (1.2.26/2934) karingServiceSE [activated enabled]
+*       *       TESTTEAM01      com.example.karing.karingService (1.2.1/827) karingService [activated enabled]

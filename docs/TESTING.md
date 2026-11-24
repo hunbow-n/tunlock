@@ -79,9 +79,10 @@ evaluated earlier would decide first and hide what tunlock does.
    `PROTECTED` or stays `BLOCKED`.
 9. **Wi-Fi change.** Switch to another network or a phone hotspot, with the
    same loop running.
-10. **Reboot in protected mode.** After login, before you start the TUN client,
-    `tunlock status` must show `BLOCKED`. Then start the client and wait for
-    `PROTECTED`.
+10. **Reboot in protected mode.** After login, `tunlock status` must show
+    `BLOCKED` until the tunnel is verified, never `DIRECT`. With `TUN_SERVICE`
+    set, the guard starts the client itself once the forward is up and the
+    rules are confirmed; otherwise start it yourself. Then wait for `PROTECTED`.
 11. **Direct mode and uninstall.** `tunlock direct` must restore normal
     internet immediately. `sudo ./uninstall.sh` must leave
     `sudo pfctl -a com.apple/000.tunlock -sr` empty and the internet working.

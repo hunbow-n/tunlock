@@ -105,7 +105,7 @@ parse_common() {
   parse_bypass
   # Name of the TUN client's VPN service in "scutil --nc list" (e.g. Karing):
   # optional; when set, on/off also start and stop it.
-  [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
+  [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._()-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
   [[ -z $TUN_MASK || $TUN_MASK =~ ^0x[0-9a-f]{8}$ ]] || die "TUN_MASK must look like 0xfffffffc"
   TUN_NET=$(tun_net "$TUN_MASK")
   [[ $PROBE_INTERVAL =~ ^[0-9]+$ ]] && (( PROBE_INTERVAL >= 5 )) || die "PROBE_INTERVAL must be >= 5"
@@ -490,10 +490,13 @@ bypass_targets() {
   for item in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do echo "$item/32"; done
 }
 
-# The last sockaddr in a route reply is the interface address when IFA
-# is present. Ignore the socket request printed before the reply.
+# "interface gateway source" of a route. The last sockaddr in the reply is
+# the interface address when IFA is present; the socket request printed
+# before the reply is ignored. Arguments go to route get: an address gives
+# the route traffic takes (possibly a host route cloned from ours), -net or
+# -host the route for exactly that destination.
 route_info() {
-  route -n -v get "$1" 2>/dev/null | awk '
+  route -n -v get "$@" 2>/dev/null | awk '
     $1 == "interface:" { iface = $2 }
     $1 == "gateway:" { gateway = $2 }
     $1 == "sockaddrs:" && $0 ~ /[<,]IFA>/ {
@@ -521,12 +524,19 @@ sync_bypass_routes() {
     [[ $keep != *" $net "* ]] || continue
     keep="$keep $net "
     [[ -n $phys && $gw =~ ^[0-9.]+$ && $src =~ ^[0-9.]+$ ]] || continue
-    read -r cur_if cur_gw cur_src <<< "$(route_info "$(net_probe_ip "$net")")"
+    read -r cur_if cur_gw _ <<< "$(route_info "$(net_probe_ip "$net")")"
     rec=$(awk -v n="$net" '$1 == n { print $2; exit }' "$RUN_DIR/routes")
     if [[ $cur_if == "$phys" && ( -z $cur_gw || $cur_gw == "$gw" || $cur_gw == link#* ) ]]; then
       # A recorded source can disagree with the kernel even on the same
-      # interface and gateway. Change only a route that Tunlock recorded.
-      [[ -n $rec && $cur_gw == "$rec" && $cur_src != "$src" ]] || continue
+      # interface and gateway. Change only a route that Tunlock recorded,
+      # judged by that route itself: traffic may follow a host route cloned
+      # from it, which keeps its own source, and would ask for a change on
+      # every tick. An unknown source is never a reason to change.
+      [[ -n $rec && $cur_gw == "$rec" ]] || continue
+      if [[ $net == */32 ]]; then read -r _ _ cur_src <<< "$(route_info -host "${net%/32}")"
+      else read -r _ _ cur_src <<< "$(route_info -net "$net")"
+      fi
+      [[ -n $cur_src && $cur_src != "$src" ]] || continue
       if route_op change "$net" "$gw" -ifp "$phys" -ifa "$src" >/dev/null 2>&1; then
         route_forget "$net"
         echo "$net $gw $phys $src" >> "$RUN_DIR/routes"
@@ -547,7 +557,7 @@ sync_bypass_routes() {
       echo "$net $gw $phys $src" >> "$RUN_DIR/routes"
       log "exception: $net via $gw ($phys, $src)"
     fi
-    read -r cur_if cur_gw <<< "$(route_info "$(net_probe_ip "$net")")"
+    read -r cur_if _ <<< "$(route_info "$(net_probe_ip "$net")")"
     [[ $cur_if == "$phys" ]] || G_WARNING="$net routes via ${cur_if:-nothing}, not $phys (a route tunlock did not create may be in the way)"
   done
   while read -r net rec _; do
@@ -805,7 +815,7 @@ guard_tick() {
     fi
     rm -f "$RUN_DIR/armed"
     G_APPLIED='' G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0
-    G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT=''
+    G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT='' G_SVC_LEFT=3
     if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
     return
   fi
@@ -858,6 +868,49 @@ guard_tick() {
   # Tell the sleep helper the tunnel is closed, so the Mac may sleep.
   if (( sleeping )) && [[ $rules_ok == 1 && ! -e $RUN_DIR/sleep-ack ]]; then touch "$RUN_DIR/sleep-ack"; fi
 
+  # A TUN client that gave up (its port was dead while the entry blinked) is
+  # started again once the forward is back: nothing else brings the tunnel
+  # up. Only behind confirmed rules, a few tries per time the forward comes
+  # back, and never again once a tunnel was up: a client the user stopped
+  # on purpose stays stopped.
+  local fwd=0
+  if [[ $UPSTREAM == proxy ]]; then [[ $G_ENTRY == up ]] && fwd=1
+  else [[ $G_SSH == up ]] && fwd=1
+  fi
+  if (( ! fwd )); then G_SVC_LEFT=3 G_SVC_HELD=''
+  elif [[ -n $tun ]]; then G_SVC_LEFT=0
+  elif [[ -n $TUN_SERVICE && $sleeping == 0 && $rules_ok == 1 && $G_ARMED == 1 && -z $G_ERROR ]] \
+    && (( G_SVC_LEFT > 0 && now - G_SVC_AT >= 60 * (3 - G_SVC_LEFT) )) \
+    && [[ $G_SVC_HELD != svc || -z $G_SVC_WARN ]]; then  # a missing service waits for the minute check
+    # The same checks as the verdict, right now: pf on, the anchor reached,
+    # nothing deciding before it, and protection still asked for. Checked
+    # every tick, logged once: the start follows as soon as they pass.
+    if ! pf_enabled || ! pf_anchor_reachable || [[ -n $(pf_conflicts | head -1) ]] || ! pf_rules_live \
+      || [[ $(read_mode) != protected ]]; then
+      [[ $G_SVC_HELD == pf ]] || log "not starting the TUN app: pf protection is not confirmed"
+      G_SVC_HELD=pf
+    else
+      G_SVC_AT=$now
+      resolve_tun_service
+      if [[ -n $SVC_WARN ]]; then
+        [[ $G_SVC_HELD == svc ]] || log "not starting the TUN app: $SVC_WARN"
+        G_SVC_HELD=svc
+      else
+        G_SVC_HELD='' G_SVC_LEFT=$((G_SVC_LEFT - 1))
+        log "the forward is up but no tunnel is: starting $SVC_NAME"
+        as_console_user scutil --nc start "$SVC_REF" >/dev/null 2>&1 || true
+        (( G_SVC_LEFT > 0 )) || log "$SVC_NAME did not bring a tunnel up; start it yourself"
+      fi
+    fi
+  fi
+  # A configured TUN app that no longer exists is shown, checked once a minute.
+  if [[ -n $TUN_SERVICE ]] && (( now - G_SVC_CHECK_AT >= 60 )); then
+    G_SVC_CHECK_AT=$now
+    resolve_tun_service
+    G_SVC_WARN=$SVC_WARN
+  fi
+  [[ -n $G_WARNING || -z $G_SVC_WARN ]] || G_WARNING=$G_SVC_WARN
+
   if [[ -n $G_TUN && $rules_ok == 1 && $G_ARMED == 1 && $sleeping == 0 ]]; then
     local interval=$PROBE_INTERVAL
     [[ $G_EGRESS_OK == 1 ]] || interval=3
@@ -901,6 +954,7 @@ guard_init() {
   G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0 G_EGRESS_CHECK=pending
   G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
   G_ENTRY=unknown G_ENTRY_AT=0 G_SLEEPING=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
+  G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD=''
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0
   # ...unless what may pass outside the tunnel changed (another proxy or
@@ -942,7 +996,11 @@ cmd_guard() {
 # Fills SSH_ARGS with the full ssh command line for the current network.
 build_ssh_args() {
   local iface=$1 identity=${SSH_IDENTITY/#\~/$HOME}
-  local common="-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+  # ConnectTimeout also bounds the banner exchange, so a relay that answers
+  # slowly still gets a chance. The alive counters ride out a short entry
+  # blink instead of tearing the tunnel down: the guard verifies the exit on
+  # its own and closes the rules when the tunnel really is gone.
+  local common="-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=6"
   SSH_ARGS=(ssh -NT -p "$SSH_PORT" -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none)
   # shellcheck disable=SC2206
   SSH_ARGS+=($common)
@@ -973,21 +1031,36 @@ cmd_ssh_run() {
     while [[ $(read_mode) != protected ]]; do sleep 2; done
     log "tunlock is on: starting SSH forward"
   fi
-  # A new SSH connection must use the physical route, not the tunnel it feeds.
-  iface=$(physical_iface)
-  if [[ -z $iface ]]; then
-    log "no physical IPv4 default route"
-    sleep 5
-    exit 1
-  fi
   local identity=${SSH_IDENTITY/#\~/$HOME}
-  # The macOS agent starts empty after login; load the key from Keychain.
-  if [[ -n $identity ]] && ! ssh-add -l >/dev/null 2>&1; then
-    ssh-add --apple-use-keychain "$identity" </dev/null >/dev/null 2>&1 || true
-  fi
-  build_ssh_args "$iface"
-  log "ssh to $SSH_HOST:$SSH_PORT${JUMP_HOST:+ through $JUMP_HOST:$JUMP_PORT} via $iface"
-  exec "${SSH_ARGS[@]}"
+  # A blinking entry (a busy relay, a flaky uplink) must not become a retry
+  # storm: every attempt is a new connection the entry may rate limit, and
+  # launchd would respawn this job within seconds of each failure. Back off
+  # between attempts, and stop as soon as protection is switched off.
+  local attempt=0 delay rc
+  while :; do
+    # Every attempt takes the physical route as it is now (Wi-Fi may have
+    # become Ethernet), never the tunnel it feeds.
+    iface=$(physical_iface)
+    rc=0
+    if [[ -z $iface ]]; then
+      log "no physical IPv4 default route"
+      rc=1
+    else
+      # The macOS agent starts empty after login; load the key from Keychain.
+      if [[ -n $identity ]] && ! ssh-add -l >/dev/null 2>&1; then
+        ssh-add --apple-use-keychain "$identity" </dev/null >/dev/null 2>&1 || true
+      fi
+      build_ssh_args "$iface"
+      log "ssh to $SSH_HOST:$SSH_PORT${JUMP_HOST:+ through $JUMP_HOST:$JUMP_PORT} via $iface"
+      "${SSH_ARGS[@]}" || rc=$?  # under set -e a bare failure would end the loop
+    fi
+    [[ $(read_mode) == protected ]] || { log "tunlock is off: SSH forward idle"; return 0; }
+    if (( rc == 0 )); then attempt=0; else attempt=$((attempt + 1)); fi
+    delay=$((5 + attempt * 5)); (( delay > 60 )) && delay=60
+    log "ssh exited ($rc); next attempt in ${delay}s"
+    sleep "$delay" &
+    wait $! || true
+  done
 }
 
 # ---------------------------------------------------------------- cli
@@ -1078,8 +1151,15 @@ cmd_protect() {
   v=$(compute_verdict)
   # Rules confirmed first, so the TUN client can only come up behind them.
   if [[ ( $v == protected || $v == blocked ) && -n $TUN_SERVICE ]]; then
-    as_console_user scutil --nc start "$TUN_SERVICE" >/dev/null 2>&1 || true
-    echo "Started $TUN_SERVICE. Waiting for a verified tunnel..."
+    resolve_tun_service
+    if [[ -n $SVC_WARN ]]; then
+      echo "tunlock: $SVC_WARN" >&2
+    else
+      # Only the guard starts the TUN client: once the forward (or the proxy
+      # port) answers, with pf and the mode checked in that same tick, so an
+      # off that comes in meanwhile can never be followed by a start.
+      echo "The guard starts $SVC_NAME once the $([[ $UPSTREAM == proxy ]] && echo "proxy port answers" || echo "SSH forward is up"). Waiting for a verified tunnel..."
+    fi
     for (( i = 0; i < limit + 10; i++ )); do
       [[ $(compute_verdict) == protected ]] && break
       sleep 1
@@ -1191,6 +1271,55 @@ cmd_direct() {
 
 # The logged-in user owns the SSH keeper and the TUN client.
 console_uid() { echo "${SUDO_UID:-$(stat -f %u /dev/console)}"; }
+# The VPN service to control, as SVC_REF (UUID, or the configured name when
+# nothing better is known) and SVC_NAME (for messages). A TUN client update
+# may register its VPN again as "<name> (<variant>)", e.g. "Karing (system)",
+# and leave the old service with a provider that is gone: starting it only
+# times out while protection sits in "block". Such a rename is taken only
+# when it is the single one, from the same app as the configured service
+# (when that still exists), and the configured one cannot start.
+provider_live() { # UUID of a VPN service
+  local bundle
+  bundle=$(scutil --nc show "$1" 2>/dev/null | awk -F' : ' '/NEProviderBundleIdentifier/ { print $2; exit }')
+  [[ -n $bundle ]] || return 1
+  # Whole field, not a substring: karingService must not match karingServiceSE.
+  systemextensionsctl list 2>/dev/null |
+    awk -v b="$bundle" '{ for (i = 1; i <= NF; i++) if ($i == b && $0 ~ /activated enabled/) found = 1 } END { exit !found }'
+}
+
+resolve_tun_service() {
+  SVC_REF=$TUN_SERVICE SVC_NAME=$TUN_SERVICE SVC_WARN=''
+  [[ -n $TUN_SERVICE ]] || return 0
+  local list exact='' exact_app='' name uuid app
+  local -a cand=() cand_name=() similar=()
+  # "uuid<TAB>app<TAB>name" per VPN service: app is the "(bundle id)" field.
+  # A failed listing is "nothing known", never the end of the guard.
+  list=$({ scutil --nc list 2>/dev/null || true; } | awk -F'"' 'NF >= 2 { split($1, a, " "); if (a[3] != "" && a[4] == "VPN") print a[3] "\t" a[5] "\t" $2 }')
+  [[ -n $list ]] || return 0
+  while IFS=$'\t' read -r uuid app name; do
+    [[ $name == "$TUN_SERVICE" ]] && exact=$uuid exact_app=$app
+  done <<< "$list"
+  while IFS=$'\t' read -r uuid app name; do
+    [[ $name == "$TUN_SERVICE ("*")" ]] || continue
+    similar+=("$name")
+    [[ -n $exact && $app == "$exact_app" ]] || continue
+    cand+=("$uuid") cand_name+=("$name")
+  done <<< "$list"
+  if [[ -z $exact ]]; then
+    # Without the old service nothing confirms which app a lookalike is from.
+    SVC_WARN="VPN service \"$TUN_SERVICE\" no longer exists${similar[0]:+ (found: ${similar[*]})}: choose the TUN app again in Settings"
+    return 0
+  fi
+  SVC_REF=$exact
+  provider_live "$exact" && return 0
+  if (( ${#cand[@]} == 1 )) && provider_live "${cand[0]}"; then
+    log "TUN_SERVICE \"$TUN_SERVICE\" cannot start; using \"${cand_name[0]}\" of the same app" >&2
+    SVC_REF=${cand[0]} SVC_NAME=${cand_name[0]}
+  elif (( ${#cand[@]} > 1 )); then
+    SVC_WARN="VPN service \"$TUN_SERVICE\" cannot start and has several successors (${cand_name[*]}): choose one in Settings"
+  fi
+}
+
 as_console_user() { local uid; uid=$(console_uid); sudo -u "#$uid" -- "$@"; }
 
 stop_keeper_and_service() {
@@ -1198,7 +1327,7 @@ stop_keeper_and_service() {
   uid=$(console_uid)
   # Restarted, the keeper sees mode off and idles without holding the port.
   launchctl kickstart -k "gui/$uid/$SSH_LABEL" >/dev/null 2>&1 || true
-  if [[ -n $TUN_SERVICE ]]; then as_console_user scutil --nc stop "$TUN_SERVICE" >/dev/null 2>&1 || true; fi
+  if [[ -n $TUN_SERVICE ]]; then resolve_tun_service; as_console_user scutil --nc stop "$SVC_REF" >/dev/null 2>&1 || true; fi
 }
 
 # The guard's reason, unless its state is too old to say anything.

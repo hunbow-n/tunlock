@@ -1,0 +1,4 @@
+#!/bin/bash
+# Prints the activated system extensions a test fixture declares.
+[[ ${1-} == list && -n ${STUB_SYSEXT:-} ]] && cat "$STUB_SYSEXT"
+exit 0
