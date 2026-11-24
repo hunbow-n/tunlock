@@ -303,6 +303,83 @@ expect_eq "reason: no state at all" "$(reason)" "no_state"; rm -rf "$STUB"
 guard_setup; gt 2; sed -i '' '/^reason=/d' "$STUB/run/state"
 expect_eq "reason: a guard that writes no reason gives unknown, not a guess" "$(reason)" "unknown"; rm -rf "$STUB"
 
+# tunlock run: the command starts only after a fresh check for this request
+printf '#!/bin/bash\nprintf "%%s|" "$@"; exit 7\n' > "$hook.prog"; chmod +x "$hook.prog"
+# run_case setup -- run args...: the guard ticks until the client is done,
+# like the real one. Leaves $STUB/run.rc and $STUB/run.out; the client reads
+# $RUN_CONF if set (a config edited after the guard started).
+run_case() {
+  local setup=$1; shift 2
+  guard_setup; gt 1; eval "$setup"
+  ( TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=${RUN_CONF:-$STUB/conf} TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
+      $T run "$@" > "$STUB/run.out" 2>&1; echo $? > "$STUB/run.rc" ) &
+  local i
+  for (( i = 0; i < 40; i++ )); do
+    [[ -e $STUB/run.rc ]] && break
+    gt 1; sleep 0.2
+  done
+  wait
+}
+rr() { echo "$(cat "$STUB/run.rc") $(grep -c "$1" "$STUB/run.out")"; }
+run_case : -- --timeout 5 -- "$hook.prog" "a b" '$x' ''
+expect_eq "run: a verified exit starts the command with its arguments and status" \
+  "$(cat "$STUB/run.rc") $(tail -1 "$STUB/run.out")" '7 a b|$x||'
+expect_eq "run: says which exit was verified" "$(grep -c 'exit 203.0.113.10 verified' "$STUB/run.out")" "1"; rm -rf "$STUB"
+run_case : -- --quiet --timeout 5 -- "$hook.prog" q
+expect_eq "run: --quiet prints only the command's output" "$(cat "$STUB/run.rc") $(cat "$STUB/run.out")" "7 q|"; rm -rf "$STUB"
+mkdir -p "$hook.bin"; cp "$hook.prog" "$hook.bin/myprog"
+PATH=$hook.bin:$PATH run_case : -- --quiet --timeout 5 -- myprog p
+expect_eq "run: the command is looked up in the caller's PATH" "$(cat "$STUB/run.rc") $(cat "$STUB/run.out")" "7 p|"
+rm -rf "$STUB" "$hook.bin"
+run_case 'echo direct > "$STUB/db/mode"' -- --timeout 5 -- "$hook.prog"
+expect_eq "run: direct mode refuses at once" "$(rr 'not started: off')" "125 1"; rm -rf "$STUB"
+run_case 'echo 198.51.100.9 > "$STUB/egress"' -- --timeout 5 -- "$hook.prog"
+expect_eq "run: an unexpected exit refuses at once" "$(rr 'not started: exit_mismatch')" "125 1"; rm -rf "$STUB"
+run_case "sed -i '' 's/^utun7:/utunX:/' \"\$STUB/ifconfig.txt\"" -- --timeout 2 -- "$hook.prog"
+expect_eq "run: no TUN interface refuses after the timeout with the reason" "$(rr 'not started: no_tun')" "125 1"; rm -rf "$STUB"
+run_case 'rm -f "$STUB/egress"' -- --timeout 2 -- "$hook.prog"
+expect_eq "run: an exit that stops answering refuses, even if it was verified before" "$(rr 'not started: exit_no_answer')" "125 1"; rm -rf "$STUB"
+RUN_CONF=$hook.conf run_case '{ cat "$STUB/conf"; echo "# edited"; } > "$hook.conf"' -- --timeout 5 -- "$hook.prog"
+expect_eq "run: a config changed after the guard started refuses" "$(rr 'configuration changed')" "125 1"; rm -rf "$STUB" "$hook.conf"
+run_case 'echo 1 > "$STUB/stat_uid"' -- --timeout 2 -- "$hook.prog"
+expect_eq "run: a request from a system account gets no answer" "$(rr 'no answer from the guard')" "125 1"; rm -rf "$STUB"
+expect_eq "run: an unknown command is 127 and asks nothing" \
+  "$(TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$F/good.conf $T run -- no-such-cmd-xyz >/dev/null 2>&1; echo $?)" "127"
+expect_eq "run: without -- arguments it is a usage error" \
+  "$(TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$F/good.conf $T run >/dev/null 2>&1; echo $?)" "2"
+guard_setup; gt 1; rm -rf "$STUB/run/check"
+TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T run -- "$hook.prog" > "$STUB/run.out" 2>&1; echo $? > "$STUB/run.rc"
+expect_eq "run: a guard without the check channel refuses" "$(rr 'takes no checks')" "125 1"; rm -rf "$STUB"
+# The queue is read by a background scanner: wait for it like the next tick would.
+scan_wait() { local i; for (( i = 0; i < 50; i++ )); do [[ -e $STUB/run/check.scan ]] || return 0; sleep 0.1; done; }
+guard_setup; gt 1; scan_wait; echo keep > "$STUB/target"; ln -s "$STUB/target" "$STUB/run/check/0123456789abcdef0123456789abcdef"; : > "$STUB/run/check/not-an-id"; gt 1; scan_wait; gt 1; scan_wait
+expect_eq "run: the guard drops links and bad names without following them" \
+  "$(cat "$STUB/target") $(find "$STUB/run/check" "$STUB/run/answer" -mindepth 1 | wc -l | tr -d ' ')" "keep 0"
+rm -rf "$STUB"
+guard_setup; gt 1; scan_wait
+for i in $(seq 1 40); do : > "$STUB/run/check/junk$i"; done
+: > "$STUB/run/check/0123456789abcdef0123456789abcdef"
+gt 1; scan_wait
+expect_eq "run: a scan looks at a bounded number of queue entries" \
+  "$(find "$STUB/run/check" -mindepth 1 | wc -l | tr -d ' ')" "25"
+rm -rf "$STUB"
+slow_find=$(mktemp -d); cp "$STUBS"/* "$slow_find/"; printf '#!/bin/bash\n[[ $1 == */check ]] && sleep 6\nexec /usr/bin/find "$@"\n' > "$slow_find/find"; chmod +x "$slow_find/find"
+guard_setup; t0=$(date +%s)
+TUNLOCK_TEST_PATH=$slow_find TUNLOCK_CONF=$STUB/conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
+  TUNLOCK_RESOLVER_DIR=$STUB/resolver TUNLOCK_TEST_IFCONFIG=$STUB/ifconfig.txt $T _guard-ticks 2 > "$STUB/guard.log" 2>&1
+expect_eq "run: a slow queue listing never holds up the guard's tick" \
+  "$(( $(date +%s) - t0 < 4 )) $(st phase)" "1 open"
+pkill -f "$slow_find/find" 2>/dev/null || true; rm -rf "$STUB" "$slow_find"
+# A directory where the answer's temporary file goes: the write must fail.
+guard_setup; gt 1; scan_wait; mkdir "$STUB/run/answer/.0123456789abcdef0123456789abcdef"; : > "$STUB/run/check/0123456789abcdef0123456789abcdef"
+gt 1; scan_wait; gt 1; rc=$?
+expect_eq "run: an answer that cannot be written is logged, the guard keeps running" \
+  "$rc $(grep -c 'could not answer a tunlock run check' "$STUB/guard.log")" "0 1"
+scan_wait; rm -rf "$STUB/run/check" "$STUB/run/answer"; gt 1
+expect_eq "run: removed check directories are made again" \
+  "$([[ -d $STUB/run/check && -k $STUB/run/check ]] && echo sticky) $([[ -d $STUB/run/answer ]] && echo answer)" "sticky answer"
+rm -rf "$STUB" "$hook.prog"
+
 guard_setup; echo "req-42" > "$STUB/db/request"; gt 1
 expect_eq "guard: echoes the request id it has applied" "$(st ack) $(st mode)" "req-42 protected"
 rm -rf "$STUB"

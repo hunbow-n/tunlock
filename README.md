@@ -303,6 +303,7 @@ Everything the app does is also a command:
 tunlock on            # firewall first, then SSH and the TUN app
 tunlock off           # nothing blocked, SSH port freed, TUN app stopped; asks first while Claude Code, Codex, ChatGPT run
 tunlock ai-clients    # AI apps still running that would reconnect directly once off
+tunlock run -- claude # start a command only after a fresh check of the exit (exit 125 if refused)
 tunlock status        # SSH, verified exit IP, pf state, why it is blocked  (--porcelain for scripts)
 sudo tunlock test     # live leak test: PASS / FAIL / SKIP per check, then what is UNCONFIRMED here
 tunlock doctor        # check the installation
@@ -317,6 +318,19 @@ TCP port only means the port answers; the exit is checked separately. An old
 state shows `stale` instead of the last reason. `--porcelain` prints the code
 as `reason=`, and the app and MCP use the same codes.
 Logs: `/var/log/tunlock.log` (guard) and `~/Library/Logs/tunlock-ssh.log`.
+
+`tunlock run [--quiet] [--timeout N] -- command [args]` runs as you, without
+sudo. It asks the guard for a fresh exit check made for this very request and
+starts the command only if that check found protected mode, a verified exit
+and the configuration unchanged since the guard started. The check is made
+right before the start; it does not hold protection on afterwards, and an
+off at that very moment is not excluded yet (#21). Otherwise it exits with 125
+and the reason; 126/127 mean the command cannot run. The command replaces
+`tunlock run`, so its output, terminal, Ctrl-C and exit status are its own.
+After the start, the firewall keeps protecting it like any other program: if
+the exit is lost, its traffic is blocked, not sent directly. Switching
+Tunlock off does not stop it: from then on it goes out directly, like
+everything else.
 
 Without the app: `sudo ./install.sh` (the first run creates the config), edit
 the config, then run `sudo ./install.sh` again. Add `--sudoers` to switch

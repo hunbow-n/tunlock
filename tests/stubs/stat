@@ -1,3 +1,5 @@
 #!/bin/bash
-# stat -f %u /dev/console
+# stat -f %u /dev/console -> 501. For a tunlock run request (…/check/<id>):
+# its owner, the caller unless $STUB/stat_uid says otherwise.
+if [[ ${*: -1} == */check/* ]]; then cat "$STUB/stat_uid" 2>/dev/null || id -u; exit 0; fi
 echo 501

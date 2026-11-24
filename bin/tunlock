@@ -4,6 +4,8 @@
 # TUN client or the egress check fails, the internet stays blocked until
 # the path is verified again or you choose direct mode yourself.
 set -euo pipefail
+# tunlock run starts the user's command with the user's own PATH.
+USER_PATH=$PATH
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # Tests swap system tools for stubs. Root never sees this: sudo and launchd
 # start with a clean environment.
@@ -790,6 +792,8 @@ guard_tick() {
   G_LAST_TICK=$now
   G_MODE=$(read_mode)
   G_ACK_NEXT=$req
+  G_PROBED=0
+  checks_take
   G_ERROR=''
   G_WARNING=''
   G_PHYS=$(physical_iface)
@@ -914,8 +918,9 @@ guard_tick() {
   if [[ -n $G_TUN && $rules_ok == 1 && $G_ARMED == 1 && $sleeping == 0 ]]; then
     local interval=$PROBE_INTERVAL
     [[ $G_EGRESS_OK == 1 ]] || interval=3
-    if (( now - G_PROBE_AT >= interval )); then
-      G_PROBE_AT=$now
+    # A pending tunlock run gets a probe of its own, made after its request.
+    if (( now - G_PROBE_AT >= interval )) || [[ -n $G_CHECKS ]]; then
+      G_PROBE_AT=$now G_PROBED=1
       local loc=''
       read -r ip loc <<< "$(probe_egress || true)"
       [[ $loc =~ ^[A-Z]{2}$ ]] || loc=''
@@ -955,6 +960,7 @@ guard_init() {
   G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
   G_ENTRY=unknown G_ENTRY_AT=0 G_SLEEPING=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
   G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD=''
+  checks_init
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0
   # ...unless what may pass outside the tunnel changed (another proxy or
@@ -963,6 +969,93 @@ guard_init() {
   if [[ -e $RUN_DIR/armed && $(cat "$RUN_DIR/armed") == "$(policy_fingerprint)" ]] && pf_rules_live; then
     G_ARMED=1
   fi
+}
+
+# ---- fresh exit checks for tunlock run
+# Users ask by creating an empty file named by a random id in CHECK_DIR
+# (root's, sticky, writable by all, like /tmp). The kernel records who
+# created it; the guard probes the exit in the same tick and writes the
+# answer to ANSWER_DIR, which only root can write. The channel can only ask
+# for a probe: it changes no mode, rule or setting.
+CHECK_DIR=$RUN_DIR/check
+ANSWER_DIR=$RUN_DIR/answer
+CHECK_ID_RE='^[0-9a-f]{32}$'
+
+checks_init() {
+  checks_dirs
+  G_CHECKS='' G_CONF_HASH=$(conf_hash)
+}
+
+# Recreated when missing; a failure only means tunlock run gets no answer.
+checks_dirs() {
+  { mkdir -p "$CHECK_DIR" "$ANSWER_DIR" && chmod 1733 "$CHECK_DIR" && chmod 755 "$ANSWER_DIR"; } 2>/dev/null \
+    || log "cannot prepare the tunlock run check directories"
+}
+
+conf_hash() { shasum -a 256 < "$CONF" 2>/dev/null | awk '{ print $1 }'; }
+
+# Requests are read by a scanner in the background, never by the tick: the
+# directory is writable by everyone, and listing a huge one would hold up
+# pf work. The tick takes what a finished scan found (requests that existed
+# before this tick, so the probe below is made after them) and starts the
+# next scan. A scan looks at most CHECK_PER_TICK entries: plain files with a
+# valid id, from root or a regular user; it removes what it looked at.
+CHECK_PER_TICK=16
+checks_take() {
+  local take=$RUN_DIR/check.take mark=$RUN_DIR/check.scan pid
+  G_CHECKS=''
+  [[ -d $CHECK_DIR && -d $ANSWER_DIR ]] || checks_dirs
+  if [[ -f $take ]]; then
+    G_CHECKS=$(tr '\n' ' ' < "$take" 2>/dev/null || true)
+    rm -f "$take" 2>/dev/null || true
+  fi
+  pid=$(cat "$mark" 2>/dev/null || true)
+  if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+  checks_scan &
+  echo $! > "$mark" 2>/dev/null || true
+}
+
+checks_scan() {
+  local f id uid n=0 out=''
+  while IFS= read -r -d '' f; do
+    (( n++ < CHECK_PER_TICK )) || break
+    id=${f##*/}
+    if [[ $id =~ $CHECK_ID_RE && -f $f && ! -L $f ]]; then
+      uid=$(stat -f %u "$f" 2>/dev/null || true)
+      if [[ $uid =~ ^[0-9]+$ ]] && (( uid == 0 || uid >= 500 )); then out+="$id:$uid"$'\n'; fi
+    fi
+    # Never recursive: a tree someone built in here is not ours to walk.
+    if [[ -d $f && ! -L $f ]]; then rmdir "$f" 2>/dev/null || true; else rm -f "$f" 2>/dev/null || true; fi
+  done < <(find "$CHECK_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+  if [[ -n $out ]]; then
+    printf '%s' "$out" > "$RUN_DIR/check.take.tmp" 2>/dev/null && mv -f "$RUN_DIR/check.take.tmp" "$RUN_DIR/check.take" 2>/dev/null
+  fi
+  rm -f "$RUN_DIR/check.scan" 2>/dev/null || true
+}
+
+# After the tick: one answer per request, from this tick's own state.
+checks_answer() {
+  local c id uid tmp
+  find "$ANSWER_DIR" -type f -mmin +2 -delete 2>/dev/null || true
+  for c in $G_CHECKS; do
+    id=${c%%:*} uid=${c#*:}
+    tmp=$ANSWER_DIR/.$id
+    # Never the end of the guard: a lost answer only times out that run.
+    # The answer is written in one step whose failure is checked, and only
+    # a regular file ever becomes the answer.
+    local body
+    body=$(printf '%s\n' "id=$id" "uid=$uid" "at=$(date +%s)" "probed=$G_PROBED" "mode=$G_MODE" \
+      "egress_ok=$G_EGRESS_OK" "egress_ip=$G_EGRESS_IP" "egress_country=$G_EGRESS_COUNTRY" \
+      "reason=$(guard_reason)" "config=$G_CONF_HASH")
+    if ( printf '%s\n' "$body" > "$tmp" ) 2>/dev/null && [[ -f $tmp && ! -L $tmp ]] \
+      && chmod 644 "$tmp" 2>/dev/null && mv -f "$tmp" "$ANSWER_DIR/$id" 2>/dev/null; then
+      :
+    else
+      [[ ! -f $tmp ]] || rm -f "$tmp" 2>/dev/null || true
+      log "could not answer a tunlock run check"
+    fi
+  done
+  G_CHECKS=''
 }
 
 # Starts tunlock-sleepwatch next to the guard when it is installed.
@@ -986,6 +1079,7 @@ cmd_guard() {
   while :; do
     guard_tick
     write_state
+    checks_answer
     sleep "$TICK" &
     wait $! || true
   done
@@ -1373,6 +1467,73 @@ entry_desc() {
   esac
 }
 
+# tunlock run [--timeout N] -- command [args]: start the command as you,
+# only after the guard verified the exit for this very request. Exit 125
+# when tunlock refuses, 126/127 when the command cannot run, otherwise the
+# command's own status (it replaces this process: same pid, tty, signals).
+RUN_REFUSED=125
+cmd_run() {
+  local timeout=30 quiet=0
+  while (( $# )); do
+    case $1 in
+      -q | --quiet) quiet=1; shift ;;
+      --timeout) [[ ${2:-} =~ ^[0-9]{1,4}$ ]] || { echo "tunlock run: --timeout takes seconds" >&2; return 2; }
+                 timeout=$2; shift 2 ;;
+      --) shift; break ;;
+      *) echo "usage: tunlock run [--quiet] [--timeout SECONDS] -- command [args]" >&2; return 2 ;;
+    esac
+  done
+  (( $# )) || { echo "usage: tunlock run [--quiet] [--timeout SECONDS] -- command [args]" >&2; return 2; }
+  [[ $EUID != 0 ]] || { echo "tunlock run: run it as your user, without sudo" >&2; return "$RUN_REFUSED"; }
+  local bin
+  bin=$(PATH=$USER_PATH command -v -- "$1" || true)
+  [[ -n $bin ]] || { echo "tunlock run: $1: command not found" >&2; return 127; }
+  load_config >/dev/null
+  run_refuse() { echo "tunlock run: not started: $*" >&2; return "$RUN_REFUSED"; }
+  guard_running || { run_refuse "the guard is not running (tunlock doctor)"; return; }
+  [[ -d $CHECK_DIR && -w $CHECK_DIR ]] || { run_refuse "the guard takes no checks; update and apply tunlock"; return; }
+  local me hash deadline id ans reason='' got
+  me=$(id -u)
+  hash=$(conf_hash)
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    ( umask 022; : > "$CHECK_DIR/$id" ) || { run_refuse "cannot ask the guard for a check"; return; }
+    ans=$ANSWER_DIR/$id got=0
+    while (( $(date +%s) <= deadline )); do
+      [[ -f $ans ]] && { got=1; break; }
+      sleep 0.2
+    done
+    rm -f "$CHECK_DIR/$id" 2>/dev/null || true
+    if (( ! got )); then
+      # A reason from an earlier answer says more than the missing last one.
+      if [[ -n $reason ]]; then run_refuse "$reason: $(reason_text "$reason") (still so after ${timeout}s)"
+      else run_refuse "no answer from the guard within ${timeout}s"
+      fi
+      return
+    fi
+    run_get() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$ans"; }
+    [[ $(run_get id) == "$id" && $(run_get uid) == "$me" ]] || { run_refuse "the answer is not for this request"; return; }
+    [[ $(run_get config) == "$hash" ]] || { run_refuse "the configuration changed since the guard started; apply it first"; return; }
+    reason=$(run_get reason)
+    if [[ $(run_get mode) == protected && $(run_get probed) == 1 && $(run_get egress_ok) == 1 && $reason == ok ]]; then
+      # The answer is this tick's; the state must still agree right now.
+      [[ $(compute_verdict) == protected ]] && break
+      reason=$(compute_reason)
+    fi
+    case $reason in
+      # Waiting does not help: the user or the exit has to change.
+      off | release_failed | pf_conflict | exit_mismatch)
+        run_refuse "$reason: $(reason_text "$reason")"; return ;;
+    esac
+    (( $(date +%s) < deadline )) || { run_refuse "$reason: $(reason_text "$reason")"; return; }
+    sleep 1
+  done
+  (( quiet )) || echo "tunlock run: exit $(run_get egress_ip) verified, starting $1" >&2
+  export PATH=$USER_PATH
+  exec "$bin" "${@:2}"
+}
+
 age() { local s=$1; (( s < 120 )) && echo "${s}s" || echo "$((s / 60))m"; }
 
 cmd_status() {
@@ -1720,6 +1881,9 @@ tunlock $VERSION: SSH tunnel keeper with a pf kill switch for macOS
   tunlock ai-clients  running AI clients that would reconnect directly once off
                       (protect / direct are the same commands)
   tunlock status      SSH, verified egress IP and pf state  [--porcelain]
+  tunlock run [--quiet] [--timeout N] -- command [args]
+                      start command as you, only after a fresh check of the exit;
+                      exit 125 when refused, else the command's own status
   tunlock test        live leak test (sudo)
   tunlock doctor      check the installation
   tunlock conflicts   pf rules that would decide before tunlock (sudo)
@@ -1739,6 +1903,7 @@ main() {
     direct | off) cmd_direct "$@" ;;
     status) cmd_status "$@" ;;
     ai-clients) ai_clients ;;
+    run) cmd_run "$@" ;;
     test) cmd_test "$@" ;;
     doctor) cmd_doctor "$@" ;;
     guard) cmd_guard ;;
@@ -1751,7 +1916,7 @@ main() {
       test_only
       load_config; guard_init
       for (( n = 0; n < ${1:-1}; n++ )); do
-        guard_tick; write_state
+        guard_tick; write_state; checks_answer
         [[ -z ${TUNLOCK_TEST_BETWEEN:-} ]] || "$TUNLOCK_TEST_BETWEEN" "$n"
       done ;;
     _sync-resolvers) test_only; load_config; G_WARNING=''; sync_resolvers; echo "warning=$G_WARNING" ;;  # tests
