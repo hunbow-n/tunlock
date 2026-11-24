@@ -86,3 +86,26 @@ evaluated earlier would decide first and hide what tunlock does.
 11. **Direct mode and uninstall.** `tunlock direct` must restore normal
     internet immediately. `sudo ./uninstall.sh` must leave
     `sudo pfctl -a com.apple/000.tunlock -sr` empty and the internet working.
+
+## Results
+
+Acceptance on a real Mac, 24 November 2026: `sudo tunlock test` at each step,
+and a loop of direct requests during sleep and the network change. Setup: macOS on Wi-Fi without IPv6, SSH cascade
+through an entry server to the exit, Karing as the TUN app, one office subnet
+and its DNS as exceptions. Build: `main` before the guard-only TUN app start
+(the change does not touch the rules or the exit check).
+
+| step | result |
+|---|---|
+| Direct reference | `RESULT=baseline`; the network has no IPv6 |
+| Protected | `RESULT=pass`: exit verified by IP, claude.ai, api.anthropic.com and chatgpt.com see the exit; direct IPv4 and UDP DNS blocked; office subnet answered |
+| SSH forward stopped | pf stayed on, tunnel checks FAIL as expected, public control requests got no answer, office subnet answered; direct checks are UNCONFIRMED because the tunnel control did not answer |
+| SSH forward restored | `RESULT=pass` with the same exit |
+| TUN app disconnected | as with the forward stopped |
+| TUN app restored | `RESULT=pass` with the same exit |
+| Sleep (64 s) and wake | exit verified again after wake; the loop of direct IPv4 requests got no answer |
+| Network change | `RESULT=pass` afterwards; which network the Mac switched to was not recorded, so this step does not count as step 9 |
+
+Not run on a real Mac yet: step 9 (switch to another network), step 7 (IPv6
+network), step 10 (reboot), step 11 (clean install and uninstall), and a plain
+proxy upstream.

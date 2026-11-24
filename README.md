@@ -16,10 +16,16 @@
   <img src="docs/screenshots/en-dark-menu.png" width="320" alt="Tunlock menu bar panel, dark">
 </p>
 
-> **Preview.** Covered by 100+ tests, with the background guard run against
-> stubbed system tools. Not yet field-tested across many real networks, sleep
-> cycles and reboots. Run the [acceptance checks](docs/TESTING.md) on your Mac
-> before you rely on it.
+> **Preview.** 200+ tests run the guard against stubbed system tools, and the
+> acceptance run on a real Mac passed: the exit was verified by IP and by what
+> claude.ai, api.anthropic.com and chatgpt.com see; direct IPv4 and UDP DNS
+> were blocked; with the SSH forward stopped or the TUN app disconnected pf
+> stayed on, public control requests got no answer and the office exception
+> kept working; after recovery and after sleep the exit was verified again.
+> Not yet checked on a real Mac: a switch to another network, an IPv6
+> network, a reboot, a clean install and uninstall, a plain proxy.
+> [Results and the checklist](docs/TESTING.md#results): run it on your Mac
+> before you rely on Tunlock.
 
 ## Why
 
