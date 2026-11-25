@@ -29,6 +29,8 @@ bad_conf() { # name, line to append or replace
 if command -v shellcheck >/dev/null; then
   if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh tools/release-key.sh 2>&1); then
     ok shellcheck; else ko shellcheck "$out"; fi
+# CI must run every check: a missing tool fails there instead of passing quietly.
+elif [[ ${GITHUB_ACTIONS:-} == true ]]; then ko shellcheck "not installed on the CI runner"
 else echo "skip shellcheck (not installed)"; fi
 
 expect_eq "open rules match golden file" "$($T render-rules open utun7 en0)" "$(cat $F/rules.open.utun7)"
@@ -881,6 +883,7 @@ if command -v swiftc >/dev/null; then
   while IFS= read -r line; do
     case $line in "ok   "*) ok "${line#ok   }" ;; "FAIL "*) ko "${line#FAIL }" ;; *) [[ -z $line ]] || ko "swift build: $line" ;; esac
   done < <(tests/swift-model.sh 2>&1)
+elif [[ ${GITHUB_ACTIONS:-} == true ]]; then ko "swift model tests" "no swiftc on the CI runner"
 else echo "skip swift model tests (no swiftc)"; fi
 
 echo "$pass passed, $fail failed"
