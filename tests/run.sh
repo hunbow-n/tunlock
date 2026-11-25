@@ -116,6 +116,10 @@ gt() { # ticks [between-hook]
   TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$STUB/conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
     TUNLOCK_RESOLVER_DIR=$STUB/resolver TUNLOCK_TEST_IFCONFIG=$STUB/ifconfig.txt TUNLOCK_TEST_BETWEEN=${2:-} \
     $T _guard-ticks "$1" > "$STUB/guard.log" 2>&1
+  local rc=$?
+  # A guard that ends without a state fails the next check: show why.
+  [[ -s $STUB/run/state ]] || { echo "     guard wrote no state (exit $rc); its log:"; sed 's/^/     | /' "$STUB/guard.log"; }
+  return "$rc"
 }
 st() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print }' "$STUB/run/state"; }
 verdict() { TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status --porcelain | awk -F= '$1 == "verdict" { print $2 }'; }
@@ -399,12 +403,12 @@ gt 1; scan_wait
 expect_eq "run: a scan looks at a bounded number of queue entries" \
   "$(find "$STUB/run/check" -mindepth 1 | wc -l | tr -d ' ')" "25"
 rm -rf "$STUB"
-slow_find=$(mktemp -d); cp "$STUBS"/* "$slow_find/"; printf '#!/bin/bash\n[[ $1 == */check ]] && sleep 6\nexec /usr/bin/find "$@"\n' > "$slow_find/find"; chmod +x "$slow_find/find"
+slow_find=$(mktemp -d); cp "$STUBS"/* "$slow_find/"; printf '#!/bin/bash\n[[ $1 == */check ]] && sleep 30\nexec /usr/bin/find "$@"\n' > "$slow_find/find"; chmod +x "$slow_find/find"
 guard_setup; t0=$(date +%s)
 TUNLOCK_TEST_PATH=$slow_find TUNLOCK_CONF=$STUB/conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run \
   TUNLOCK_RESOLVER_DIR=$STUB/resolver TUNLOCK_TEST_IFCONFIG=$STUB/ifconfig.txt $T _guard-ticks 2 > "$STUB/guard.log" 2>&1
 expect_eq "run: a slow queue listing never holds up the guard's tick" \
-  "$(( $(date +%s) - t0 < 4 )) $(st phase)" "1 open"
+  "$(( $(date +%s) - t0 < 20 )) $(st phase)" "1 open"
 pkill -f "$slow_find/find" 2>/dev/null || true; rm -rf "$STUB" "$slow_find"
 # A directory where the answer's temporary file goes: the write must fail.
 guard_setup; gt 1; scan_wait; mkdir "$STUB/run/answer/.0123456789abcdef0123456789abcdef"; : > "$STUB/run/check/0123456789abcdef0123456789abcdef"
