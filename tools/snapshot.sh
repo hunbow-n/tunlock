@@ -2,6 +2,9 @@
 # Renders docs/screenshots/*.png from the real views with sample state.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# SNAPSHOT_DIR and SNAPSHOT_SCALE=2 render Retina copies elsewhere (the website) without touching the docs.
+OUT=${SNAPSHOT_DIR:-docs/screenshots}
+export SNAPSHOT_SCALE=${SNAPSHOT_SCALE:-1}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 FLAGS=()
@@ -16,7 +19,12 @@ srcs=()
 for f in app/Sources/Tunlock/*.swift; do [[ $f == */TunlockApp.swift ]] || srcs+=("$f"); done
 swiftc -swift-version 5 -parse-as-library "${FLAGS[@]}" -framework SystemConfiguration -framework ServiceManagement -framework UserNotifications \
   "${srcs[@]}" tools/snapshot.swift -o "$TMP/snap"
-mkdir -p docs/screenshots
+mkdir -p "$OUT"
+# The menu lists AI clients the bundled CLI reports; a stub reports three, so the line shows.
+mkdir -p "$TMP/backend/bin"
+# shellcheck disable=SC2016  # the stub's own $1, written literally
+printf '#!/bin/bash\n[[ ${1:-} == ai-clients ]] && printf "ChatGPT\\nclaude\\ncodex\\n"\nexit 0\n' > "$TMP/backend/bin/tunlock"
+chmod +x "$TMP/backend/bin/tunlock"
 now=$(date +%s)
 cat > "$TMP/state" <<S
 updated=$now
@@ -70,20 +78,20 @@ export TZ=America/New_York
 # The exit changed: the menu offers to pin it.
 sed -e 's/^egress_ok=1$/egress_ok=0/' -e 's/^egress_ip=.*/egress_ip=192.0.2.44/' -e 's/^egress_country=.*/egress_country=DE/' \
   -e 's/^phase=open$/phase=probe/' "$TMP/state" > "$TMP/state-foreign"
-printf 'expected_country=\n' >> "$TMP/state-foreign"
-rm -f docs/screenshots/*.png
+printf 'expected_country=\negress_check=mismatch\nreason=exit_mismatch\n' >> "$TMP/state-foreign"
+rm -f "$OUT"/*.png
 for lang in en ru; do
   for theme in light dark; do
     sed -i '' -e "s/^updated=.*/updated=$(date +%s)/" "$TMP/state"
     env "$( [[ $theme == dark ]] && echo DARK=1 || echo LIGHT=1 )" TUNLOCK_UI_STATE="$TMP/state" TUNLOCK_UI_DAEMON="$TMP/daemon" TUNLOCK_UI_CONFIG="$TMP/conf" \
-      "$TMP/snap" "docs/screenshots/$lang-$theme" -AppleLanguages "($lang)"
+      "$TMP/snap" "$OUT/$lang-$theme" -AppleLanguages "($lang)"
   done
   sed -i '' -e "s/^updated=.*/updated=$(date +%s)/" -e "s/^egress_at=.*/egress_at=$(( $(date +%s) - 9 ))/" "$TMP/state-proxy"
   env LIGHT=1 SNAPSHOT_PROXY=1 TUNLOCK_UI_STATE="$TMP/state-proxy" TUNLOCK_UI_DAEMON="$TMP/daemon" TUNLOCK_UI_CONFIG="$TMP/conf-proxy" \
-    "$TMP/snap" "docs/screenshots/$lang-proxy" -AppleLanguages "($lang)"
-  rm -f "docs/screenshots/$lang-proxy-leaktest.png" "docs/screenshots/$lang-proxy-exit.png" "docs/screenshots/$lang-proxy-activity.png"
+    "$TMP/snap" "$OUT/$lang-proxy" -AppleLanguages "($lang)"
+  rm -f "$OUT/$lang-proxy-leaktest.png" "$OUT/$lang-proxy-exit.png" "$OUT/$lang-proxy-activity.png"
   sed -i '' "s/^updated=.*/updated=$(date +%s)/" "$TMP/state-foreign"
   env LIGHT=1 SNAPSHOT_MENU_ONLY=1 TUNLOCK_UI_STATE="$TMP/state-foreign" TUNLOCK_UI_DAEMON="$TMP/daemon" TUNLOCK_UI_CONFIG="$TMP/conf" \
-    "$TMP/snap" "docs/screenshots/$lang-foreign" -AppleLanguages "($lang)"
+    "$TMP/snap" "$OUT/$lang-foreign" -AppleLanguages "($lang)"
 done
-echo "Wrote docs/screenshots"
+echo "Wrote $OUT"

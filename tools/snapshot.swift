@@ -3,11 +3,19 @@
 import AppKit
 import SwiftUI
 
+/// A window that reports the scale SNAPSHOT_SCALE asks for (default 1), so AppKit and SwiftUI draw text,
+/// symbols and shapes at that scale even with no Retina screen attached: sharp copies for the website.
+final class ScaledWindow: NSWindow {
+    var scale: CGFloat = 1
+    override var backingScaleFactor: CGFloat { scale }
+}
+
 @MainActor
 func snapshot<V: View>(_ view: V, _ path: String) {
     let host = NSHostingView(rootView: view.environmentObject(StatusModel.shared))
     host.frame = NSRect(origin: .zero, size: host.fittingSize)
-    let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    let window = ScaledWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.scale = CGFloat(max(1, Int(ProcessInfo.processInfo.environment["SNAPSHOT_SCALE"] ?? "") ?? 1))
     window.contentView = host
     window.appearance = NSAppearance(named: ProcessInfo.processInfo.environment["DARK"] == nil ? .aqua : .darkAqua)
     host.layoutSubtreeIfNeeded()
