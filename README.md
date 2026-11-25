@@ -277,6 +277,25 @@ never touched.
 </details>
 
 <details>
+<summary><b>Claude stays closed outside the tunnel, even while off</b></summary>
+
+Tunlock keeps Anthropic's own networks (`160.79.104.0/21`, `2607:6bc0::/32`:
+api.anthropic.com, claude.ai, claude.com) closed outside the tunnel, in both
+modes:
+
+- **on:** they are reached only through the verified tunnel; no exception in
+  `BYPASS_NETS` can open them directly;
+- **off:** everything else goes directly as usual, but Claude Code, Claude
+  Desktop, IDE plugins and claude.ai in a browser can't connect until Tunlock
+  is on again. Open connections to these networks are dropped when off starts.
+
+`status` shows `Closed` with the networks, and a warning if pf could not take
+the rules. Third-party services an app also calls (telemetry, downloads
+outside Anthropic's networks) are not covered. `AI_NETS="..."` sets other
+networks, `AI_NETS=none` turns this off.
+</details>
+
+<details>
 <summary><b>Example: sing-box + plain <code>ssh -D</code> (nothing to install on the server)</b></summary>
 
 `SSH_FORWARD="-D 127.0.0.1:1080"`, `TUN_ADDR=172.19.0.1`, and a sing-box 1.12+
@@ -364,6 +383,8 @@ sleep, a Wi-Fi change, a utun renumber, reboot and uninstall.
 
 - **Early boot:** until launchd starts the guard (seconds after boot), pf has
   no Tunlock rules.
+- **Off with the guard stopped:** if the guard does not run, `tunlock off`
+  removes every rule, including the one keeping Claude closed.
 - **Root can undo it:** `pfctl -d` or flushing the anchor works for any root
   process. The guard restores the rules within 2 seconds.
 - **The local network is blocked** while on (printers, AirDrop, NAS), except

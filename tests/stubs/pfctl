@@ -10,6 +10,7 @@ while (( $# )); do
     -sr) op=show; arg=rules ;;
     -E) op=enable ;;
     -X) op=release; shift ;;
+    -k) op="kill"; arg="$arg $2"; shift ;;
   esac
   shift
 done
@@ -40,6 +41,7 @@ case $op in
         cat "$STUB/children-${anchor//\//_}" 2>/dev/null || true ;;
     esac ;;
   enable) touch "$STUB/enabled"; echo "pf enabled"; echo "Token : 4242" ;;
+  kill) echo "kill${arg}" >> "$STUB/kill.log" ;;
   release) [[ ! -e $STUB/release_fail ]] || exit 1; echo released >> "$STUB/release.log" ;;
 esac
 exit 0

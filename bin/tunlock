@@ -37,7 +37,7 @@ is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # ---------------------------------------------------------------- config
 
-CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS EXPECTED_COUNTRY PROBE_URL PROBE_INTERVAL PF_ANCHOR'
+CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS AI_NETS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS EXPECTED_COUNTRY PROBE_URL PROBE_INTERVAL PF_ANCHOR'
 
 # Parse KEY=value lines without sourcing: the guard runs as root.
 load_config() {
@@ -105,6 +105,7 @@ load_config() {
 # Settings shared by both upstreams.
 parse_common() {
   parse_bypass
+  parse_ai_nets
   # Name of the TUN client's VPN service in "scutil --nc list" (e.g. Karing):
   # optional; when set, on/off also start and stop it.
   [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._()-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
@@ -174,6 +175,30 @@ parse_bypass() {
     DNS_SERVERS+=("$ip")
   done
 }
+
+# AI services' own networks, closed outside the tunnel in both modes: off,
+# a client can't reach them directly; on, no exception can open them. The
+# default holds Anthropic's (ARIN: Anthropic, PBC), where api.anthropic.com,
+# claude.ai and claude.com live. AI_NETS=none turns it off.
+DEFAULT_AI_NETS="160.79.104.0/21 2607:6bc0::/32"
+is_cidr6() {
+  [[ $1 =~ ^([0-9a-fA-F:]+)/([0-9]{1,3})$ && ${BASH_REMATCH[1]} == *:*:* ]] || return 1
+  local bits=${BASH_REMATCH[2]}
+  (( bits >= 16 && bits <= 128 ))
+}
+parse_ai_nets() {
+  local item
+  AI4=() AI6=()
+  [[ -n $AI_NETS ]] || AI_NETS=$DEFAULT_AI_NETS
+  [[ $AI_NETS != none ]] || return 0
+  for item in $AI_NETS; do
+    if is_cidr "$item"; then AI4+=("$item")
+    elif is_cidr6 "$item"; then AI6+=("$item")
+    else die "AI_NETS: $item is not a network like 160.79.104.0/21 or 2607:6bc0::/32 (or none)"
+    fi
+  done
+}
+ai_closing() { (( ${#AI4[@]} + ${#AI6[@]} > 0 )); }
 
 # SSH_FORWARD holds -L/-D options, e.g. "-L 127.0.0.1:1080:127.0.0.1:8388".
 # The first one gives the local port that health checks look at.
@@ -272,6 +297,15 @@ render_rules() {
   local phase=$1 ifc=${2:-} phys=${3:-} body
   [[ -z $phys || $phys =~ ^en[0-9]+$ ]] || die "render_rules: bad physical interface $phys"
   case $phase in
+    direct)
+      # Off: only the AI networks are closed, everywhere; the rest is direct.
+      ai_closing || die "render_rules: AI_NETS=none leaves nothing for direct mode"
+      body=$(render_ai_block '')
+      local label
+      label="label \"tunlock-$(md5 -q -s "$body" | cut -c1-12)\""
+      echo "# tunlock $VERSION phase=direct"
+      echo "${body//$'\n'/ $label$'\n'} $label"
+      return ;;
     block) ;;
     probe | open) [[ $ifc =~ ^utun[0-9]+$ ]] || die "render_rules: bad interface $ifc" ;;
     *) die "render_rules: unknown phase $phase" ;;
@@ -285,6 +319,8 @@ render_rules() {
 render_body() {
   local phase=$1 ifc=$2 phys=$3 item
   echo "pass quick on lo0 all no state"
+  # Before any pass: no entry or exception reaches the AI networks directly.
+  render_ai_block "$ifc"
   echo "pass out quick inet proto tcp to $ENTRY_HOST port $ENTRY_PORT flags any keep state (if-bound)"
   # A proxy may also carry UDP (SOCKS5 UDP associate, QUIC-capable protocols).
   [[ $UPSTREAM != proxy ]] || echo "pass out quick inet proto udp to $ENTRY_HOST port $ENTRY_PORT keep state (if-bound)"
@@ -317,7 +353,15 @@ render_body() {
   esac
 }
 
-rules_label() { awk -F'"' '/^block drop quick all label/ { print $2 }' <<< "$1"; }
+# AI networks: blocked on every interface but the tunnel (none: everywhere).
+render_ai_block() {
+  local net on=''
+  [[ -z $1 ]] || on="on ! $1 "
+  for net in ${AI4[@]+"${AI4[@]}"}; do echo "block drop out quick ${on}inet from any to $net"; done
+  for net in ${AI6[@]+"${AI6[@]}"}; do echo "block drop out quick ${on}inet6 from any to $net"; done
+}
+
+rules_label() { awk -F'"' '/label "tunlock-/ { l = $2 } END { print l }' <<< "$1"; }
 
 pf_enabled() { pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; }
 pf_has_label() { [[ -n $1 ]] && pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -qF "label \"$1\""; }
@@ -649,6 +693,8 @@ write_state() {
     echo "pf_conflict=$G_CONFLICT"
     echo "warning=$G_WARNING"
     echo "bypass=${BYPASS_LIST[*]-}"
+    echo "ai_nets=$(ai_closing && echo "${AI4[*]-} ${AI6[*]-}" | xargs)"
+    echo "ai_closed=$G_AI_CLOSED"
     echo "reason=$(guard_reason)"
   } > "$tmp"
   chmod 644 "$tmp"
@@ -714,6 +760,43 @@ guard_sync_rules() {
   log "pf: FAILED to apply phase $want: $G_ERROR"
   fail_closed
   return 1
+}
+
+# Direct mode with AI_NETS: the tunnel rules go, in one transaction, and
+# only the AI networks stay closed. Connections to them opened before (or
+# through the tunnel) are dropped. A failure here is a warning, not a failed
+# switch: the rest of direct mode works, but the AI networks are NOT closed.
+guard_direct_ai() {
+  local rules net err=''
+  G_AI_CLOSED=0
+  rules=$(render_rules direct)
+  if [[ $rules != "$G_APPLIED" ]] || ! pf_has_label "$(rules_label "$rules")"; then
+    if ! pf_enabled || [[ ! -s $RUN_DIR/token ]]; then pf_enable_ref >/dev/null || err="pf could not be enabled"; fi
+    [[ -n $err ]] || ensure_root_ruleset || err="root pf ruleset does not reach anchor $PF_ANCHOR"
+    if [[ -z $err ]] && pf_apply "$rules"; then
+      G_APPLIED=$rules
+      for net in ${AI4[@]+"${AI4[@]}"}; do pfctl -k 0.0.0.0/0 -k "$net" >/dev/null 2>&1 || true; done
+      for net in ${AI6[@]+"${AI6[@]}"}; do pfctl -k ::/0 -k "$net" >/dev/null 2>&1 || true; done
+      log "direct mode: only the AI networks stay closed: $AI_NETS"
+    else
+      err=${err:-$G_ERROR}
+      G_ERROR='' G_APPLIED=''
+      [[ $G_AI_WARNED == "$err" ]] || log "direct mode: AI networks NOT closed: $err"
+      G_AI_WARNED=$err
+      G_WARNING="AI networks NOT closed outside the tunnel: $err"
+      return
+    fi
+  fi
+  if ! pf_enabled; then err="pf is disabled"
+  elif ! pf_anchor_reachable; then err="root pf ruleset does not reach anchor $PF_ANCHOR"
+  elif [[ -n $(pf_conflicts | head -1) ]]; then err="other pf rules decide before tunlock (tunlock conflicts)"
+  fi
+  if [[ -n $err ]]; then
+    G_WARNING="AI networks NOT closed outside the tunnel: $err"
+    G_APPLIED=''  # load again next tick
+    return
+  fi
+  G_AI_CLOSED=1 G_AI_WARNED=''
 }
 
 # The wanted set was rejected, and the anchor may still hold an older, more
@@ -810,15 +893,18 @@ guard_tick() {
   fi
 
   if [[ $G_MODE == direct ]]; then
-    if [[ -n $G_APPLIED || -e $RUN_DIR/token ]] || pf_rules_live; then
+    if ai_closing; then
+      guard_direct_ai
+    elif [[ -n $G_APPLIED || -e $RUN_DIR/token ]] || pf_rules_live; then
       if pf_release; then
         log "direct mode: rules removed, pf reference released"
       else
         log "direct mode: FAILED to remove rules: $G_ERROR"
       fi
+      G_APPLIED=''
     fi
     rm -f "$RUN_DIR/armed"
-    G_APPLIED='' G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0
+    G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0
     G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT='' G_SVC_LEFT=3
     if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
     return
@@ -849,6 +935,9 @@ guard_tick() {
   fi
   local rules_ok=1
   guard_sync_rules || rules_ok=0
+  # The AI block is part of every phase's rules.
+  G_AI_CLOSED=0
+  if ai_closing && (( rules_ok )); then G_AI_CLOSED=1; fi
 
   if ! pf_enabled || [[ ! -s $RUN_DIR/token ]]; then
     if pf_enable_ref; then
@@ -959,7 +1048,7 @@ guard_init() {
   G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0 G_EGRESS_CHECK=pending
   G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
   G_ENTRY=unknown G_ENTRY_AT=0 G_SLEEPING=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
-  G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD=''
+  G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD='' G_AI_CLOSED=0 G_AI_WARNED=''
   checks_init
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0
@@ -1293,7 +1382,12 @@ confirm_off() {
   if clients=$(ai_clients); then
     [[ -n $clients ]] || return 0
     echo "Still running: $(paste -sd, - <<< "$clients" | sed 's/,/, /g')."
-    echo "Once off, their next request leaves with your direct IP. Close them first (/exit in Claude Code)."
+    if ( load_config >/dev/null; ai_closing ) 2>/dev/null; then
+      echo "Claude stays closed while off (AI_NETS): its requests fail instead of leaving directly."
+      echo "Any other client's next request leaves with your direct IP. Close them first."
+    else
+      echo "Once off, their next request leaves with your direct IP. Close them first (/exit in Claude Code)."
+    fi
   else
     echo "Could not check for running AI clients (Claude Code, Codex, ChatGPT)."
     echo "If any is open, its next request leaves with your direct IP once off."
@@ -1587,6 +1681,9 @@ cmd_status() {
   printf '%-8s %s\n' Egress "$e_line  expected $exp${ec:+ in $ec}${tun:+  via $tun}"
   printf '%-8s %s\n' PF "phase $phase, pf $( [[ $pfe == 1 ]] && echo enabled || echo disabled ), $pfr rules in $(state_get pf_anchor)"
   [[ -z $(state_get bypass) ]] || printf '%-8s %s\n' Direct "$(state_get bypass) (around the tunnel)"
+  if [[ $(state_get ai_closed) == 1 ]]; then
+    printf '%-8s %s\n' Closed "$(state_get ai_nets) (AI services: only through the tunnel)"
+  fi
   local reason
   reason=$(compute_reason)
   [[ $reason == ok || $reason == off ]] || printf '%-8s %s\n' Reason "$reason: $(reason_text "$reason")"
@@ -1596,7 +1693,9 @@ cmd_status() {
   case $verdict in
     protected) echo "=> PROTECTED: traffic leaves only through the verified tunnel" ;;
     blocked) echo "=> BLOCKED: no verified tunnel, direct traffic is dropped" ;;
-    direct) echo "=> DIRECT: no kill switch, traffic leaves through your normal connection" ;;
+    direct)
+      echo "=> DIRECT: no kill switch, traffic leaves through your normal connection"
+      [[ $(state_get ai_closed) != 1 ]] || echo "   except AI services (Claude): closed until tunlock is on" ;;
     unprotected) echo "=> NOT PROTECTED: protected mode is on but tunlock's pf rules are not (alone) in force" ;;
     error) echo "=> SWITCH FAILED: direct mode was asked, but tunlock rules could not be removed" ;;
     unknown) echo "=> UNKNOWN: guard state is $(age $((now - ${updated:-0}))) old; is the guard running?" ;;

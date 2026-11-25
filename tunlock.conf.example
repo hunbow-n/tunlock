@@ -37,6 +37,12 @@ SSH_FORWARD="-D 127.0.0.1:1080"
 #BYPASS_NETS="192.168.0.0/24"
 #BYPASS_DNS="corp.example=192.168.0.1"
 
+# AI services' own networks, closed outside the tunnel in both modes. On, no
+# exception can open them directly; off, everything else goes directly, but
+# Claude can't connect until tunlock is on again. Default: Anthropic's
+# networks (api.anthropic.com, claude.ai, claude.com). none: don't close.
+#AI_NETS="160.79.104.0/21 2607:6bc0::/32"
+
 # IPv4 address your TUN client (Karing, sing-box, ...) puts on its utun
 # interface. The utun number may change; the address must not.
 TUN_ADDR=172.19.0.1

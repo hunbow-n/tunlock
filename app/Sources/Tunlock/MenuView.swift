@@ -193,7 +193,7 @@ struct MenuView: View {
                 Text(prompt == .checkFailed ? L("Could not check AI apps", "Не удалось проверить AI-приложения")
                      : L("AI apps are still running", "AI-приложения ещё запущены"))
                     .font(.headline)
-                Text(prompt.message)
+                Text(prompt.message(claudeClosed: !(model.state["ai_nets"] ?? "").isEmpty))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                 Button {
@@ -221,6 +221,8 @@ struct MenuView: View {
             (text, icon, color) = (L("Running, through Tunlock: \(names)", "Запущены, идут через Tunlock: \(names)"), "sparkles", .secondary)
         case .blocked:
             (text, icon, color) = (L("Running, blocked for now: \(names)", "Запущены, пока заблокированы: \(names)"), "exclamationmark.shield", .orange)
+        case .direct where model.state["ai_closed"] == "1" && model.aiClients.allSatisfy({ $0.hasPrefix("Claude") }):
+            (text, icon, color) = (L("Running, closed until Tunlock is on: \(names)", "Запущены, закрыты до включения Tunlock: \(names)"), "lock", .secondary)
         case .direct:
             (text, icon, color) = (L("Running, going direct: \(names)", "Запущены, идут напрямую: \(names)"), "exclamationmark.triangle", .orange)
         default:
@@ -244,7 +246,9 @@ struct MenuView: View {
                 detail: phys.map { "Wi‑Fi / Ethernet · \($0)" } ?? L("no network", "нет сети"))
             if v == .direct {
                 Hop(status: .neutral, title: L("Internet, directly", "Интернет напрямую"),
-                    detail: L("no tunnel, no kill switch", "без туннеля и без защиты"), last: true)
+                    detail: s["ai_closed"] == "1"
+                        ? L("no tunnel; Claude is closed until Tunlock is on", "без туннеля; Claude закрыт, пока Tunlock выключен")
+                        : L("no tunnel, no kill switch", "без туннеля и без защиты"), last: true)
             } else {
                 if s["upstream"] == "proxy" {
                     let up = s["entry_up"]

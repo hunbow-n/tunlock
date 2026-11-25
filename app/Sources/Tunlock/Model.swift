@@ -69,12 +69,27 @@ enum OffPrompt: Equatable {
     case clients([String])
     case checkFailed
 
-    var message: String {
+    /// Claude's own processes: with AI_NETS on, Anthropic stays closed while off.
+    static let claudeProcesses: Set<String> = ["claude", "Claude"]
+
+    /// claudeClosed: the guard keeps Anthropic's networks closed outside the tunnel.
+    func message(claudeClosed: Bool) -> String {
         switch self {
         case .clients(let processes):
-            let list = aiDisplayNames(processes).joined(separator: ", ")
-            return L("\(list): their next request will leave with your direct IP. Close them first (/exit in Claude Code), then turn Tunlock off.",
-                     "\(list): их следующий запрос уйдёт с вашим прямым IP. Сначала закройте их (/exit в Claude Code), потом выключайте Tunlock.")
+            let closed = claudeClosed ? processes.filter { Self.claudeProcesses.contains($0) } : []
+            let open = processes.filter { !closed.contains($0) }
+            var parts: [String] = []
+            if !open.isEmpty {
+                let list = aiDisplayNames(open).joined(separator: ", ")
+                parts.append(L("\(list): their next request will leave with your direct IP. Close them first (/exit in Claude Code), then turn Tunlock off.",
+                               "\(list): их следующий запрос уйдёт с вашим прямым IP. Сначала закройте их (/exit в Claude Code), потом выключайте Tunlock."))
+            }
+            if !closed.isEmpty {
+                let list = aiDisplayNames(closed).joined(separator: ", ")
+                parts.append(L("\(list): Anthropic stays closed while Tunlock is off, so their requests fail instead of leaving directly.",
+                               "\(list): пока Tunlock выключен, Anthropic закрыт, поэтому их запросы не уйдут напрямую, а завершатся ошибкой."))
+            }
+            return parts.joined(separator: " ")
         case .checkFailed:
             return L("Tunlock could not check for running AI apps. If Claude Code, Codex or ChatGPT is open, its next request will leave with your direct IP.",
                      "Tunlock не смог проверить, запущены ли AI-приложения. Если открыт Claude Code, Codex или ChatGPT, его следующий запрос уйдёт с вашим прямым IP.")

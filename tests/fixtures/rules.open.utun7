@@ -1,8 +1,10 @@
 # tunlock 0.1.0 phase=open
 pass quick on lo0 all no state
+block drop out quick on ! utun7 inet from any to 160.79.104.0/21
+block drop out quick on ! utun7 inet6 from any to 2607:6bc0::/32
 pass out quick inet proto tcp to 203.0.113.10 port 22 flags any keep state (if-bound)
 pass out quick inet proto udp from any port 68 to any port 67 no state
 pass in quick inet proto udp from any port 67 to any port 68 no state
 pass out quick on utun7 inet from 10.20.0.1 to any no state
 pass in quick on utun7 inet from any to 10.20.0.1 no state
-block drop quick all label "tunlock-b505ae99d532"
+block drop quick all label "tunlock-5c64eeb71600"

@@ -14,7 +14,7 @@ trap 'rm -f "$conf"' EXIT
 } > "$conf"
 fail=0
 for c in tests/fixtures/good.conf "$conf" ${1:+"$1"}; do
-  for phase in block probe open; do
+  for phase in block probe open direct; do
     if out=$(TUNLOCK_CONF=$c bin/tunlock render-rules "$phase" utun7 en0 | pfctl -nf - 2>&1); then
       echo "ok   pfctl parses $phase ($c)"
     else

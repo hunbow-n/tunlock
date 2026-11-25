@@ -41,7 +41,10 @@ expect_eq "probe phase: the probe plus the TUN stack's internal leg" \
 for phase in block probe open; do
   r=$($T render-rules $phase utun7)
   grep -E '^pass' <<< "$r" | grep -Ev 'quick' && ko "$phase: every pass is quick" || ok "$phase: every pass is quick"
-  grep -q 'inet6' <<< "$r" && ko "$phase: no IPv6 pass" || ok "$phase: no IPv6 pass"
+  grep -qE '^pass.*inet6' <<< "$r" && ko "$phase: no IPv6 pass" || ok "$phase: no IPv6 pass"
+  # The AI networks are closed before the first pass that could reach them.
+  expect_eq "$phase: AI networks closed before any pass but lo0" \
+    "$(grep -vE '^#|on lo0' <<< "$r" | head -2 | awk '{ print $1, $NF }' | paste -sd' ' -)" "block 160.79.104.0/21 block 2607:6bc0::/32"
 done
 $T render-rules open en0 >/dev/null 2>&1 && ko "refuses non-utun interface" || ok "refuses non-utun interface"
 
@@ -186,16 +189,49 @@ expect_eq "guard: an unreadable interface is never reported as taken down" \
   "$(st error | grep -c 'could NOT confirm taken down: utun7') $(st error | grep -c '; taken down:')" "1 0"
 rm -rf "$STUB"
 
-guard_setup; printf '#!/bin/bash\necho direct > "$STUB/db/mode"; touch "$STUB/flush_fail"\n' > "$hook"; gt 2 "$hook"
+guard_setup; echo AI_NETS=none >> "$STUB/conf"; printf '#!/bin/bash\necho direct > "$STUB/db/mode"; touch "$STUB/flush_fail"\n' > "$hook"; gt 2 "$hook"
 expect_eq "guard: direct mode with rules stuck in pf is a failed switch, not direct" \
   "$(verdict) | $(st error) | $([[ -e $STUB/release.log ]] && echo released || echo kept)" \
   "error | pf did not remove the tunlock rules | kept"
 rm -rf "$STUB"
 
-guard_setup; printf '#!/bin/bash\necho direct > "$STUB/db/mode"; touch "$STUB/read_fail"\n' > "$hook"; gt 2 "$hook"
+guard_setup; echo AI_NETS=none >> "$STUB/conf"; printf '#!/bin/bash\necho direct > "$STUB/db/mode"; touch "$STUB/read_fail"\n' > "$hook"; gt 2 "$hook"
 expect_eq "guard: direct mode when pf does not answer is a failed switch" "$(verdict) | $(st error)" \
   "error | pf did not answer; tunlock rules may still be loaded"
 rm -rf "$STUB"
+
+# Direct mode: everything goes directly, except the AI networks (#35)
+guard_setup; printf '#!/bin/bash\n[[ $1 == 0 ]] && echo direct > "$STUB/db/mode"\nexit 0\n' > "$hook"; gt 3 "$hook"
+expect_eq "direct: only the AI networks stay closed, on every interface" \
+  "$(verdict) | $(grep -vc '^$' "$STUB/anchor") | $(grep -c 'quick inet from any to 160.79.104.0/21 label' "$STUB/anchor") $(grep -c 'quick inet6 from any to 2607:6bc0::/32 label' "$STUB/anchor") | $(grep -c 'block drop quick all' "$STUB/anchor")" \
+  "direct | 2 | 1 1 | 0"
+expect_eq "direct: the state says the AI networks are closed" "$(st ai_closed) | $(st ai_nets) | $(st reason) | [$(st warning)]" \
+  "1 | 160.79.104.0/21 2607:6bc0::/32 | off | []"
+expect_eq "direct: open connections to the AI networks are dropped, the rest kept" \
+  "$(paste -sd'|' "$STUB/kill.log")" "kill 0.0.0.0/0 160.79.104.0/21|kill ::/0 2607:6bc0::/32"
+expect_eq "direct: pf stays enabled with tunlock's reference" "$([[ -e $STUB/enabled ]] && echo on) $([[ -e $STUB/release.log ]] && echo released || echo kept)" "on kept"
+out=$(TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status 2>&1)
+grep -q 'except AI services (Claude): closed' <<< "$out" && grep -q '^Closed   160.79.104.0/21 2607:6bc0::/32' <<< "$out" \
+  && ok "direct: status says Claude stays closed" || ko "direct: status says Claude stays closed" "$out"
+expect_eq "direct: two ticks in direct mode load the rules once" "$(grep -c 'only the AI networks stay closed' "$STUB/guard.log")" "1"
+echo protected > "$STUB/db/mode"; gt 2
+expect_eq "direct -> protected: the tunnel rules replace the direct ones" "$(verdict) $(st ai_closed) $(tail -1 "$STUB/anchor" | cut -c1-20)" "protected 1 block drop quick all"
+rm -rf "$STUB"
+guard_setup; echo direct > "$STUB/db/mode"; : > "$STUB/pf_fail"; gt 2
+expect_eq "direct: a rejected AI block is a warning, the switch to direct still holds" \
+  "$(verdict) | $(st ai_closed) | $(st warning | cut -c1-41) | [$(st error)]" "direct | 0 | AI networks NOT closed outside the tunnel | []"
+rm -rf "$STUB"
+guard_setup; echo direct > "$STUB/db/mode"; printf 'pass out quick all\nanchor "com.apple/*" all\n' > "$STUB/root_rules"; gt 2
+expect_eq "direct: a rule deciding before tunlock means the AI networks are not closed" \
+  "$(verdict) | $(st ai_closed) | $(st warning)" "direct | 0 | AI networks NOT closed outside the tunnel: other pf rules decide before tunlock (tunlock conflicts)"
+rm -rf "$STUB"
+guard_setup; echo AI_NETS=none >> "$STUB/conf"; echo direct > "$STUB/db/mode"; gt 2
+expect_eq "direct: AI_NETS=none keeps the old direct mode, nothing loaded" \
+  "$(verdict) | $(st ai_closed) | [$(st ai_nets)] | [$(cat "$STUB/anchor" 2>/dev/null)]" "direct | 0 | [] | []"
+rm -rf "$STUB"
+bad_conf "an AI network that is not a network" "AI_NETS=claude.ai"
+expect_eq "AI_NETS takes custom IPv4 and IPv6 networks" \
+  "$(tmpa=$(mktemp); cat "$F/good.conf" > "$tmpa"; echo 'AI_NETS="198.51.100.0/24 2001:db8::/32"' >> "$tmpa"; TUNLOCK_CONF=$tmpa $T render-rules direct | grep -c label; rm -f "$tmpa")" "2"
 
 # pf conflicts: rules that decide before tunlock make "protected" untrue
 guard_setup; printf 'scrub-anchor "com.apple/*" all fragment reassemble\npass out quick all\nanchor "com.apple/*" all\n' > "$STUB/root_rules"; gt 2
