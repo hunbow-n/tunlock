@@ -11,9 +11,34 @@ struct MenuView: View {
     @AppStorage(HopNames.entryKey) private var entryName = ""
     @AppStorage(HopNames.exitKey) private var exitName = ""
 
+    /// Height of everything above the footer, measured as laid out.
+    @State private var bodyHeight: CGFloat = 0
+    /// The footer, its divider and the panel's own padding.
+    private let footerRoom: CGFloat = 44 + Shape.panelPadding * 2 + Shape.footerInset
+
     var body: some View {
-        let v = model.verdict
+        let limit = panelMaxHeight() - footerRoom
         VStack(alignment: .leading, spacing: 12) {
+            // Taller than the screen allows: the middle scrolls, the footer stays.
+            if bodyHeight > limit {
+                ScrollView(.vertical) { content }.frame(height: limit)
+            } else {
+                content
+            }
+            Divider()
+            footer
+        }
+        .padding(Shape.panelPadding)
+        // The footer sits in the panel's rounded corners: give it room so the
+        // corner curve never clips "Settings…" or "Quit".
+        .padding(.bottom, Shape.footerInset)
+        .frame(width: 340)
+        .background(PanelChrome())
+    }
+
+    private var content: some View {
+        let v = model.verdict
+        return VStack(alignment: .leading, spacing: 12) {
             header(v)
             if model.mode == "protected", model.exitIsForeign { foreignExitCard }
             if v == .notSetUp {
@@ -55,15 +80,12 @@ struct MenuView: View {
                 Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Divider()
-            footer
         }
-        .padding(Shape.panelPadding)
-        // The footer sits in the panel's rounded corners: give it room so the
-        // corner curve never clips "Settings…" or "Quit".
-        .padding(.bottom, Shape.footerInset)
-        .frame(width: 340)
-        .background(PanelChrome())
+        .fixedSize(horizontal: false, vertical: true)
+        .background(GeometryReader { g in
+            Color.clear.preference(key: BodyHeightKey.self, value: g.size.height)
+        })
+        .onPreferenceChange(BodyHeightKey.self) { bodyHeight = $0 }
     }
 
     @State private var confirmPin = false
@@ -413,4 +435,9 @@ struct Hop: View {
         case .neutral: return .secondary
         }
     }
+}
+
+private struct BodyHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }

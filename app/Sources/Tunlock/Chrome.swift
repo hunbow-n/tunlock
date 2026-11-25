@@ -36,8 +36,32 @@ struct PanelChrome: NSViewRepresentable {
         content.layer?.cornerCurve = .continuous
         content.layer?.masksToBounds = true
         window.hasShadow = true
+        fit(window, content)
         window.invalidateShadow()
     }
+
+    /// MenuBarExtra sizes its window once, when it first shows. Lines that
+    /// appear later (running AI clients, warnings, the time zone hint) then
+    /// spill past the bottom corners and hide the footer. Follow the content's
+    /// height, keeping the top edge under the menu bar.
+    private func fit(_ window: NSWindow, _ content: NSView) {
+        content.layoutSubtreeIfNeeded()
+        let want = content.fittingSize.height
+        guard want > 1, abs(window.frame.height - want) > 0.5 else { return }
+        var frame = window.frame
+        let top = frame.maxY
+        frame.size.height = want
+        frame.origin.y = top - want
+        window.setFrame(frame, display: true)
+    }
+}
+
+/// The panel's room below the menu bar, so a tall panel scrolls instead of
+/// running off a small screen.
+@MainActor
+func panelMaxHeight() -> CGFloat {
+    let screen = NSScreen.main?.visibleFrame.height ?? 800
+    return max(320, screen - 16)
 }
 
 /// The on/off control: a large pill with a lock in the knob. Green and closed
