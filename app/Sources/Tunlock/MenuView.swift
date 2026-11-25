@@ -384,6 +384,8 @@ struct MenuView: View {
             .background(Shape.card().fill(Color.primary.opacity(0.05)))
     }
 
+    @State private var confirmQuit = false
+
     private var footer: some View {
         HStack {
             Button(L("Settings…", "Настройки…")) { Windows.shared.showSettings() }
@@ -396,9 +398,20 @@ struct MenuView: View {
                 Windows.shared.showAgent()
             } label: { Image(systemName: "sparkles") }
                 .help(L("Let an AI agent set Tunlock up (MCP)", "Настроить Tunlock через ИИ-агента (MCP)"))
-            Button(L("Quit", "Выйти")) { NSApp.terminate(nil) }
+            Button(L("Quit", "Выйти")) { confirmQuit = true }
                 .keyboardShortcut("q")
                 .help(L("Protection keeps working without the app", "Защита продолжит работать без приложения"))
+                .confirmationDialog(L("Quit the Tunlock app?", "Закрыть приложение Tunlock?"), isPresented: $confirmQuit) {
+                    Button(L("Quit", "Выйти")) { NSApp.terminate(nil) }
+                    Button(L("Cancel", "Отмена"), role: .cancel) {}
+                } message: {
+                    // The guard and the tunnel run under launchd: quitting closes only this window and its notifications.
+                    Text(model.mode == "protected"
+                         ? L("Protection stays on: the internet still goes only through the verified exit. You will not see the status or get notifications until you open Tunlock again.",
+                             "Защита останется включённой: интернет по-прежнему идёт только через проверенный выход. Статус и уведомления будут недоступны, пока вы снова не откроете Tunlock.")
+                         : L("Tunlock stays off and blocks nothing. You will not see the status or get notifications until you open Tunlock again.",
+                             "Tunlock останется выключенным и ничего не блокирует. Статус и уведомления будут недоступны, пока вы снова не откроете Tunlock."))
+                }
         }
         .buttonStyle(.borderless)
         .font(.callout)
