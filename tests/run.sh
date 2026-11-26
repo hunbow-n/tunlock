@@ -641,6 +641,16 @@ STUB=$(mktemp -d); mkdir -p "$STUB/db" "$STUB/run"
 expect_eq "protect fails without any guard state" "$(cli protect)" "1"; rm -rf "$STUB"
 fake_guard protected open 0 "" 0; expect_eq "status exits 1 when not protected" "$(cli status)" "1"; done_guard
 
+# ---- install: reload waits until launchd has dropped the old job (#37)
+eval "$(sed -n '/^reload_job()/,/^}/p' install.sh)"
+# shellcheck disable=SC2329  # die is called by reload_job, loaded by eval above
+rj() { ( PATH=$STUBS:$PATH; die() { echo "die: $*"; exit 1; }; reload_job system tunlock.guard /x.plist 2>/dev/null; echo "$?" ) }
+STUB=$(mktemp -d); export STUB; echo 3 > "$STUB/launchctl.lag"
+expect_eq "install bootstraps a job only after bootout has finished" \
+  "$(rj) $(grep -c '^print system/tunlock.guard' "$STUB/launchctl.log") $(tail -1 "$STUB/launchctl.log")" \
+  "0 4 bootstrap system /x.plist"
+rm -rf "$STUB"
+
 # ---- uninstall: never delete state before pf confirms rules and reference are gone
 un_setup() {
   STUB=$(mktemp -d); export STUB

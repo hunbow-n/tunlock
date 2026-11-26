@@ -1,3 +1,11 @@
 #!/bin/bash
-# Records launchd calls.
+# Records launchd calls. With $STUB/launchctl.lag = N, a booted-out job stays
+# visible to the next N `print` calls and bootstrap fails until it is gone.
 echo "$*" >> "$STUB/launchctl.log"
+lag=$STUB/launchctl.lag
+[[ -e $lag ]] || exit 0
+n=$(cat "$lag")
+case $1 in
+  print) (( n > 0 )) || exit 113; echo $((n - 1)) > "$lag" ;;
+  bootstrap) (( n == 0 )) || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; } ;;
+esac
