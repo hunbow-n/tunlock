@@ -125,6 +125,12 @@ struct TunConfig: Equatable {
     var expectedEgress = ""
     var probeInterval = "30"
     var tunService = ""
+    /// Tunlock runs its bundled sing-box (TUN_ENGINE=sing-box) instead of a TUN app.
+    var builtinTun = false
+    /// TUN_ENGINE and TUN_SERVICE lines: the built-in TUN controls no VPN service.
+    private var tunLines: [String] {
+        builtinTun ? ["TUN_ENGINE=sing-box", "TUN_SERVICE=\"\""] : ["TUN_SERVICE=\"\(tunService)\""]
+    }
 
     var forwardString: String {
         switch forward {
@@ -141,7 +147,7 @@ struct TunConfig: Equatable {
 
     static let modeledKeys: Set<String> = [
         "UPSTREAM", "PROXY_HOST", "PROXY_PORT", "VPS_IP", "SSH_USER", "SSH_PORT", "SSH_IDENTITY", "SSH_FORWARD",
-        "JUMP_HOST", "JUMP_USER", "JUMP_PORT", "BYPASS_NETS", "BYPASS_DNS", "TUN_ADDR", "TUN_MASK", "TUN_SERVICE",
+        "JUMP_HOST", "JUMP_USER", "JUMP_PORT", "BYPASS_NETS", "BYPASS_DNS", "TUN_ADDR", "TUN_MASK", "TUN_SERVICE", "TUN_ENGINE",
         "EXPECTED_EGRESS", "EXPECTED_COUNTRY", "PROBE_INTERVAL",
     ]
 
@@ -213,8 +219,7 @@ struct TunConfig: Equatable {
             "TUN_ADDR=\(clean(tunAddr))",
             "TUN_MASK=\(tunMask)",
             "PROBE_INTERVAL=\(probeInterval)",
-            "TUN_SERVICE=\"\(tunService)\"",
-        ]
+        ] + tunLines
         if !identity.isEmpty { lines.append("SSH_IDENTITY=\(identity)") }
         if !bypassNets.isEmpty { lines.append("BYPASS_NETS=\"\(bypassNets.joined(separator: " "))\"") }
         let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
@@ -240,8 +245,7 @@ struct TunConfig: Equatable {
             "TUN_ADDR=\(clean(tunAddr))",
             "TUN_MASK=\(tunMask)",
             "PROBE_INTERVAL=\(probeInterval)",
-            "TUN_SERVICE=\"\(tunService)\"",
-        ]
+        ] + tunLines
         if !bypassNets.isEmpty { lines.append("BYPASS_NETS=\"\(bypassNets.joined(separator: " "))\"") }
         let dns = bypassDNS.filter { !$0.domain.isEmpty && !$0.server.isEmpty }
         if !dns.isEmpty { lines.append("BYPASS_DNS=\"\(dns.map { "\($0.domain)=\($0.server)" }.joined(separator: " "))\"") }
@@ -279,6 +283,7 @@ struct TunConfig: Equatable {
         c.jumpUser = values["JUMP_USER"] ?? ""
         c.jumpPort = values["JUMP_PORT"] ?? "22"
         c.tunService = values["TUN_SERVICE"] ?? ""
+        c.builtinTun = values["TUN_ENGINE"] == "sing-box"
         c.upstream = values["UPSTREAM"] == "proxy" ? "proxy" : "ssh"
         c.proxyHost = values["PROXY_HOST"] ?? ""
         c.proxyPort = values["PROXY_PORT"] ?? ""

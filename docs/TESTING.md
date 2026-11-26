@@ -86,6 +86,14 @@ evaluated earlier would decide first and hide what tunlock does.
 11. **Direct mode and uninstall.** `tunlock direct` must restore normal
     internet immediately. `sudo ./uninstall.sh` must leave
     `sudo pfctl -a com.apple/000.tunlock -sr` empty and the internet working.
+12. **Built-in TUN** (`TUN_ENGINE=sing-box`). Quit any other TUN app, then run
+    steps 1–11 with it, where step 5 is `sudo launchctl kill SIGKILL
+    system/tunlock.tun` (launchd restarts it after a crash) and then
+    `sudo launchctl bootout system/tunlock.tun` (it stays down until the
+    installer runs again). Also check that `scutil --dns` shows the utun's DNS
+    as the first resolver, and that `dig example.com` does not reach the
+    router's DNS on the physical interface. A network in `BYPASS_NETS` must
+    stay reachable, and its `BYPASS_DNS` domains must resolve.
 
 ## Results
 

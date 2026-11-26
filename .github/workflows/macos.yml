@@ -119,6 +119,12 @@ jobs:
           echo "Built architectures: $architectures"
           [[ " $architectures " == *" arm64 "* && " $architectures " == *" x86_64 "* ]]
           codesign --verify --deep --strict build/Tunlock.app
+          # The bundled sing-box accepts the config tunlock renders.
+          sb=build/Tunlock.app/Contents/Resources/backend/bin
+          "$sb/sing-box" version
+          "$sb/sing-box" check -c tests/fixtures/singbox.json
+          test -s "$sb/sing-box.LICENSE" && test -s "$sb/sing-box.NOTICE"
+          [[ " $(lipo -archs "$sb/tunlock-tun-dns") " == *" arm64 "* ]]
 
       - name: MCP server answers like an agent expects
         run: bash tests/mcp.sh build/Tunlock.app/Contents/MacOS/Tunlock

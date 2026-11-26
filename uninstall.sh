@@ -69,6 +69,9 @@ fi
 # 3. Confirmed: now remove exception routes, resolver files, jobs and files.
 if [[ -x $CLI ]]; then "$CLI" cleanup >/dev/null 2>&1 || true; fi
 rm -f "$DAEMONS/tunlock.guard.plist"
+# The built-in sing-box TUN (TUN_ENGINE=sing-box), if it was installed.
+launchctl bootout system/tunlock.tun 2>/dev/null || true
+rm -f "$DAEMONS/tunlock.tun.plist"
 if [[ -n $USER_NAME && $USER_NAME != root ]]; then
   launchctl bootout "gui/$(id -u "$USER_NAME")/tunlock.ssh" 2>/dev/null || true
   home=$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{ print $2 }')

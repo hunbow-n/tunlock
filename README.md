@@ -91,7 +91,8 @@ no answer, SSH goes down, or the Mac wakes from sleep.
 
 ## Quick start
 
-**You need** a TUN app (Karing, sing-box…) and one of these:
+**You need** a TUN app (Karing, sing-box…), or nothing extra with the
+[built-in TUN](#built-in-tun-no-extra-app), and one of these:
 
 - **your own server** you can SSH into by IPv4 (host key in `~/.ssh/known_hosts`):
   Tunlock keeps the SSH tunnel up and the TUN app sends traffic into it;
@@ -99,7 +100,7 @@ no answer, SSH goes down, or the Mac wakes from sleep.
   app: no server and no SSH needed, see [No server? Use your proxy](#no-server-use-your-proxy).
 
 Tunlock manages the firewall (and SSH, if used) around the TUN app you already
-use; it does not include one.
+use, or runs its own built-in one.
 
 ```bash
 git clone https://github.com/hunbow-n/tunlock.git && cd tunlock
@@ -142,6 +143,27 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
 
 The build is ad-hoc signed and not notarized. A copy you build yourself opens
 normally. A downloaded copy needs right-click → **Open** the first time.
+
+## Built-in TUN: no extra app
+
+Tunlock ships sing-box and can run it itself instead of Karing: set
+`TUN_ENGINE=sing-box` in the config and leave `TUN_SERVICE` empty. Nothing else
+needs to be downloaded or installed.
+
+- With `SSH_FORWARD="-D 127.0.0.1:1080"` nothing else is needed: sing-box sends
+  traffic into the SSH SOCKS forward, and a `JUMP_HOST` cascade (two servers)
+  works as before. SSH carries TCP only, so UDP is refused, never sent around.
+- For a proxy or a Shadowsocks/VLESS server, write its
+  [sing-box outbound](https://sing-box.sagernet.org/configuration/outbound/),
+  tagged `"proxy"`, into a file owned by root with mode 600 and point
+  `SINGBOX_OUTBOUND` at it. The credentials stay out of `tunlock.conf`.
+- The guard starts sing-box (launchd job `tunlock.tun`) only behind confirmed
+  firewall rules; `tunlock off` stops it. DNS goes through the tunnel. pf stays
+  the lock: if sing-box stops, the internet stops.
+- `tunlock render-singbox` prints the config it runs, changing nothing.
+
+> **Preview.** The built-in TUN passes its tests against stubbed tools and
+> `sing-box check`; the leak acceptance on a real Mac is still to be done.
 
 ## No server? Use your proxy
 
@@ -213,6 +235,8 @@ The app writes `/usr/local/etc/tunlock.conf`. You can also edit it by hand; see
 | `SSH_FORWARD` | what SSH forwards: `-L …` to a proxy on the server, or `-D` for SOCKS |
 | `JUMP_HOST`, `JUMP_USER`, `JUMP_PORT` | optional relay: SSH enters here and reaches `VPS_IP` from there |
 | `TUN_ADDR`, `TUN_MASK` | IPv4 of your TUN app's interface; the utun number may change |
+| `TUN_ENGINE` | `app` (default, your TUN app) or `sing-box` (the [built-in TUN](#built-in-tun-no-extra-app)) |
+| `SINGBOX_OUTBOUND` | built-in TUN: root-only JSON file with the sing-box outbound tagged `proxy`; not needed with an SSH `-D` forward |
 | `TUN_SERVICE` | VPN name from `scutil --nc list` (e.g. `Karing`) to start and stop with Tunlock. When an update of the TUN app registers the VPN under a new name and the configured service can no longer start, Tunlock controls the new one: only a single `<name> (…)` service of the same app, chosen by its UUID |
 | `BYPASS_NETS`, `BYPASS_DNS` | exceptions: networks reached directly, and DNS servers per domain |
 | `EXPECTED_EGRESS` | the pinned exit IP, or `any` to accept any IP (then a country is required) |
@@ -427,4 +451,7 @@ test commands, and release conventions.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The app also ships the unmodified
+[sing-box](https://github.com/SagerNet/sing-box) binary (GPLv3 or later), a
+separate program with its license and a link to its source next to it
+(`sing-box.LICENSE`, `sing-box.NOTICE`).

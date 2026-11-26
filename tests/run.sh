@@ -27,7 +27,7 @@ bad_conf() { # name, line to append or replace
 }
 
 if command -v shellcheck >/dev/null; then
-  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh tools/release-key.sh 2>&1); then
+  if out=$(shellcheck -s bash bin/tunlock install.sh uninstall.sh tests/run.sh tests/pf-syntax.sh tests/pf-live.sh tests/swift-model.sh tests/mcp.sh tests/stubs/* contrib/swiftbar/*.sh build-app.sh tools/snapshot.sh tools/release-key.sh tools/fetch-sing-box.sh 2>&1); then
     ok shellcheck; else ko shellcheck "$out"; fi
 # CI must run every check: a missing tool fails there instead of passing quietly.
 elif [[ ${GITHUB_ACTIONS:-} == true ]]; then ko shellcheck "not installed on the CI runner"
@@ -588,6 +588,69 @@ FAKE_SSH=none fake_guard protected open 1
 expect_eq "on: with a proxy upstream the CLI does not wait for SSH and leaves the start to the guard" \
   "$(TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$pxs_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T on 2>&1 | grep -c 'once the proxy port answers') | $(cat "$STUB/scutil.log" 2>/dev/null)" "1 | "; done_guard
 rm -f "$pxs_conf"
+
+# ---- built-in sing-box TUN (#57)
+sb_conf=$F/singbox.conf
+expect_eq "sing-box: config matches golden file" "$(TUNLOCK_CONF=$sb_conf $T render-singbox)" "$(cat "$F/singbox.json")"
+bad_conf "an unknown TUN_ENGINE" "TUN_ENGINE=karing"
+bad_conf "sing-box behind an -L forward without an outbound file" "TUN_ENGINE=sing-box"
+sbx=$(mktemp); { cat "$sb_conf"; echo 'TUN_SERVICE="Karing"'; } > "$sbx"
+if out=$(TUNLOCK_CONF=$sbx $T render-singbox 2>&1); then ko "sing-box: rejects a TUN_SERVICE next to it" "$out"
+else ok "sing-box: rejects a TUN_SERVICE next to it: ${out#tunlock: }"; fi
+ob=$(mktemp)
+printf 'UPSTREAM=proxy\nPROXY_HOST=198.51.100.20\nPROXY_PORT=8388\nTUN_ADDR=172.19.0.1\nTUN_ENGINE=sing-box\nSINGBOX_OUTBOUND=%s\n' "$ob" > "$sbx"
+echo '{ "type": "shadowsocks", "tag": "other", "server": "198.51.100.20", "server_port": 8388 }' > "$ob"
+if out=$(TUNLOCK_CONF=$sbx $T render-singbox 2>&1); then ko "sing-box: rejects an outbound not tagged proxy" "$out"
+else ok "sing-box: rejects an outbound not tagged proxy: ${out#tunlock: }"; fi
+echo '{ "type": "shadowsocks", "tag": "proxy", "server": "198.51.100.20", "server_port": 8388 }' > "$ob"
+out=$(TUNLOCK_CONF=$sbx $T render-singbox 2>&1)
+expect_eq "sing-box: the outbound file is used, the proxy stays outside the utun, mask defaults to /30" \
+  "$(grep -c '"type": "shadowsocks", "tag": "proxy"' <<< "$out") $(grep -c '"route_exclude_address": \[ "198.51.100.20/32" \]' <<< "$out") $(grep -c '"172.19.0.1/30"' <<< "$out")" "1 1 1"
+rm -f "$sbx" "$ob"
+expect_eq "sing-box: a config without TUN_ENGINE keeps the external TUN app" \
+  "$($T config | awk -F= '$1 == "TUN_ENGINE" { print $2 }')" "app"
+
+sb_guard() { # extra conf lines; then gt args
+  guard_setup; { cat "$sb_conf"; echo 'TUN_ADDR=10.99.0.1'; echo PROBE_INTERVAL=5; printf '%b' "$1"; } > "$STUB/conf"; shift
+  TUNLOCK_SINGBOX=${SB_BIN-$STUBS/sing-box} gt "$@"
+}
+export TUNLOCK_SINGBOX
+sb_guard '' 2
+expect_eq "sing-box: the guard starts the built-in TUN once the forward is up and no tunnel is" \
+  "$(st phase) | $(grep -c 'kickstart system/tunlock.tun' "$STUB/launchctl.log") | $([[ -e $STUB/scutil.log ]] && grep -c 'nc start' "$STUB/scutil.log")" "block | 1 | "
+rm -rf "$STUB"
+SB_BIN=/nonexistent/sing-box sb_guard '' 1
+expect_eq "sing-box: a missing binary is a warning, nothing is started" \
+  "$(cat "$STUB/launchctl.log" 2>/dev/null | grep -c 'kickstart system/tunlock.tun') | $(st warning | grep -c 'built-in sing-box is not installed')" "0 | 1"
+rm -rf "$STUB"
+guard_setup; : > "$STUB/pf_fail"; rm -f "$STUB/egress"
+{ cat "$sb_conf"; echo 'TUN_ADDR=10.99.0.1'; } > "$STUB/conf"; TUNLOCK_SINGBOX=$STUBS/sing-box gt 2
+expect_eq "sing-box: never started while pf rules are not confirmed" \
+  "$(cat "$STUB/launchctl.log" 2>/dev/null | grep -c 'kickstart system/tunlock.tun')" "0"
+rm -rf "$STUB"
+sbrun() { # mode -> exit status of tun-run
+  echo "$1" > "$STUB/db/mode"
+  TUNLOCK_SINGBOX=$STUBS/sing-box TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$sb_conf TUNLOCK_STATE_DIR=$STUB/db \
+    TUNLOCK_RUN_DIR=$STUB/run $T tun-run >/dev/null 2>&1; echo $?
+}
+guard_setup
+expect_eq "sing-box: tun-run checks the config, then runs it, readable by root only" \
+  "$(sbrun protected) | $(cat "$STUB/sing-box.log") | $(stat -f %Lp "$STUB/run/sing-box.json")" \
+  "0 | check -c $STUB/run/sing-box.json
+run -c $STUB/run/sing-box.json -D $STUB/run/sing-box | 600"
+rm -f "$STUB/sing-box.log"
+expect_eq "sing-box: tun-run does not start while protection is off" "$(sbrun direct) | $(cat "$STUB/sing-box.log" 2>/dev/null)" "0 | "
+expect_eq "sing-box: tun-run with an external TUN app exits cleanly, so launchd keeps it stopped" \
+  "$(echo protected > "$STUB/db/mode"; TUNLOCK_SINGBOX=$STUBS/sing-box TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$F/good.conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T tun-run >/dev/null 2>&1; echo $?) | $(cat "$STUB/sing-box.log" 2>/dev/null)" "0 | "
+: > "$STUB/singbox_reject"
+expect_eq "sing-box: a config sing-box rejects is never run" \
+  "$(sbrun protected) | $(grep -c '^run ' "$STUB/sing-box.log")" "1 | 0"
+rm -rf "$STUB"
+fake_guard protected open 1
+expect_eq "sing-box: off stops the built-in TUN" \
+  "$(echo direct > "$STUB/db/mode"; TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$sb_conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T off >/dev/null 2>&1; echo $?) | $(grep -c 'kill SIGTERM system/tunlock.tun' "$STUB/launchctl.log")" "0 | 1"
+done_guard
+unset TUNLOCK_SINGBOX
 
 # ---- the guard restarts a TUN client that gave up while the forward was down
 guard_setup

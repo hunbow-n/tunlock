@@ -43,6 +43,18 @@ SSH_FORWARD="-D 127.0.0.1:1080"
 # networks (api.anthropic.com, claude.ai, claude.com). none: don't close.
 #AI_NETS="160.79.104.0/21 2607:6bc0::/32"
 
+# Who brings the TUN interface up:
+#   TUN_ENGINE=app       (default) your own TUN app (Karing, sing-box GUI, ...);
+#                        name its VPN service in TUN_SERVICE to start/stop it
+#   TUN_ENGINE=sing-box  the sing-box that ships with Tunlock: no other app.
+#                        With SSH_FORWARD="-D ..." it needs nothing else (the
+#                        JUMP_HOST cascade works as before). For a proxy or a
+#                        Shadowsocks/VLESS server, put its sing-box outbound,
+#                        tagged "proxy", in a root-only file (mode 600):
+#                        SINGBOX_OUTBOUND=/usr/local/etc/tunlock-outbound.json
+#                        Leave TUN_SERVICE empty. TUN_MASK defaults to /30.
+#TUN_ENGINE=sing-box
+#SINGBOX_OUTBOUND=/usr/local/etc/tunlock-outbound.json
 # IPv4 address your TUN client (Karing, sing-box, ...) puts on its utun
 # interface. The utun number may change; the address must not.
 TUN_ADDR=172.19.0.1

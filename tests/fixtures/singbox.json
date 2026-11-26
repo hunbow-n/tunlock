@@ -1,0 +1,30 @@
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [ { "type": "tcp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy" } ],
+    "final": "remote",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun",
+      "address": [ "10.20.0.1/30" ],
+      "auto_route": true,
+      "dns_mode": "hijack",
+      "route_exclude_address": [ "198.51.100.7/32", "192.168.0.0/24", "192.168.0.1/32" ],
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    { "type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": 1080, "version": "5", "network": "tcp" },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" }
+    ],
+    "final": "proxy"
+  }
+}
