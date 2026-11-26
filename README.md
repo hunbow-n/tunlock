@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · menu bar app + CLI · MIT · <b>0.8.0</b> · <a href="README.ru.md">Русский</a>
+  macOS 14+ · menu bar app + CLI · MIT · <a href="https://github.com/hunbow-n/tunlock/releases/latest"><img src="https://img.shields.io/github/v/release/hunbow-n/tunlock?label=release" alt="Latest release" align="absmiddle"></a> · <a href="README.ru.md">Русский</a>
 </p>
 
 <p align="center">
