@@ -1,3 +1,5 @@
 #!/bin/bash
 echo "default            192.168.1.1        UGScg                 en0"
+# A reader that stops early makes this late write fail, as a long table would.
+[[ ! -e ${STUB:-}/netstat_slow ]] || sleep 0.2
 echo "default            10.20.0.1          UGScIg              utun6"
