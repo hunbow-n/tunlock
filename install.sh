@@ -9,6 +9,14 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 PREFIX=/usr/local
 SRC=$(cd "$(dirname "$0")" && pwd -P)
 die() { echo "install: $*" >&2; exit 1; }
+# Reload a launchd job. bootout returns before launchd has dropped the job, and
+# a bootstrap in that window fails with "Bootstrap failed: 5" (#37): wait it out.
+reload_job() { # domain, label, plist
+  local n=0
+  launchctl bootout "$1/$2" 2>/dev/null || true
+  while launchctl print "$1/$2" >/dev/null 2>&1 && (( n++ < 50 )); do sleep 0.1; done
+  launchctl bootstrap "$1" "$3" || die "$2 did not start; the config is saved, run the installer again"
+}
 
 [[ $EUID == 0 ]] || die "run with sudo"
 USER_NAME=${SUDO_USER:-}
@@ -67,8 +75,7 @@ install -d -o root -g wheel -m 755 /var/db/tunlock
 sed "s|@PREFIX@|$PREFIX|g" "$SRC/launchd/tunlock.guard.plist" > /Library/LaunchDaemons/tunlock.guard.plist
 chown root:wheel /Library/LaunchDaemons/tunlock.guard.plist
 chmod 644 /Library/LaunchDaemons/tunlock.guard.plist
-launchctl bootout system/tunlock.guard 2>/dev/null || true
-launchctl bootstrap system /Library/LaunchDaemons/tunlock.guard.plist
+reload_job system tunlock.guard /Library/LaunchDaemons/tunlock.guard.plist
 
 # SSH keeper runs as the user, with the user's keys and known_hosts.
 AGENT=$USER_HOME/Library/LaunchAgents/tunlock.ssh.plist
@@ -79,8 +86,7 @@ as_user /bin/mkdir -p "$USER_HOME/Library/LaunchAgents" "$USER_HOME/Library/Logs
 # shellcheck disable=SC2016  # $1 expands in the user shell
 sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@HOME@|$USER_HOME|g" "$SRC/launchd/tunlock.ssh.plist" \
   | as_user /bin/sh -c 'umask 022; cat > "$1.tmp" && mv -f "$1.tmp" "$1"' sh "$AGENT"
-launchctl bootout "gui/$USER_UID/tunlock.ssh" 2>/dev/null || true
-launchctl bootstrap "gui/$USER_UID" "$AGENT"
+reload_job "gui/$USER_UID" tunlock.ssh "$AGENT"
 
 if (( SUDOERS )); then
   tmp=$(mktemp)
