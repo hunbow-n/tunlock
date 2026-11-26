@@ -60,13 +60,14 @@ jobs:
           fi
 
           # Read complete commit messages. A breaking-change footer can appear after the body.
+          # Skip merge commits: their "Merge pull request" subject is not a change.
           breaking_header='^[a-z][a-z0-9-]*(\([^)]+\))?!:[[:blank:]]+'
           breaking_footer=$'(^|\n)BREAKING[ -]CHANGE:[[:blank:]]+([^[:space:]][^\n]*)'
           feature_header='^feat(\([^)]+\))?:[[:blank:]]+'
           fix_header='^(fix|perf)(\([^)]+\))?:[[:blank:]]+'
           notes="$RUNNER_TEMP/tunlock-release-notes.md"
           : > "$notes"
-          bump=$(git log -z --format='%s%x00%b' "$range" | {
+          bump=$(git log -z --no-merges --format='%s%x00%b' "$range" | {
             level=0
             while IFS= read -r -d '' subject && IFS= read -r -d '' body; do
               printf -- '- %s\n' "$subject" >> "$notes"
