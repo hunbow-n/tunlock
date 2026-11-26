@@ -139,6 +139,11 @@ guard_setup; : > "$STUB/netstat_slow"; gt 2
 expect_eq "guard: survives netstat writing after awk has its line (#45)" "$(st phase) $(st egress_ok)" "open 1"
 rm -rf "$STUB"
 
+guard_setup; : > "$STUB/pfctl_slow"; gt 2
+expect_eq "guard: a pfctl that writes after the match still reads as enabled with rules" \
+  "$(st phase) $(st pf_enabled) [$(st error)]" "open 1 []"
+rm -rf "$STUB"
+
 guard_setup; : > "$STUB/pf_fail"; gt 2
 expect_eq "guard: rejected pf load is never reported as a phase" \
   "$(st phase)|$(verdict)|$([[ -e $STUB/states.log ]] && echo reset || echo none)" "failed|unprotected|none"

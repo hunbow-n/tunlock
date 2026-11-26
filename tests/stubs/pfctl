@@ -44,4 +44,9 @@ case $op in
   kill) echo "kill${arg}" >> "$STUB/kill.log" ;;
   release) [[ ! -e $STUB/release_fail ]] || exit 1; echo released >> "$STUB/release.log" ;;
 esac
+# $STUB/pfctl_slow: one more line after a pause, as a long ruleset would write.
+# A reader that stops at its match makes this write fail.
+if [[ $op == show && ( $arg == info || -n $anchor ) && -e $STUB/pfctl_slow ]]; then
+  sleep 0.2; echo "# end" || exit 1
+fi
 exit 0
