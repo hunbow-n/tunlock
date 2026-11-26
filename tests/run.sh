@@ -133,6 +133,10 @@ grep -q 'on utun7 inet from 10.20.0.1 to any' "$STUB/anchor" && grep -q 'label "
 expect_eq "guard: connections reset once after rules are in place" "$(wc -l < "$STUB/states.log" | tr -d ' ')" "1"
 rm -rf "$STUB"
 
+guard_setup; : > "$STUB/netstat_slow"; gt 2
+expect_eq "guard: survives netstat writing after awk has its line (#45)" "$(st phase) $(st egress_ok)" "open 1"
+rm -rf "$STUB"
+
 guard_setup; : > "$STUB/pf_fail"; gt 2
 expect_eq "guard: rejected pf load is never reported as a phase" \
   "$(st phase)|$(verdict)|$([[ -e $STUB/states.log ]] && echo reset || echo none)" "failed|unprotected|none"

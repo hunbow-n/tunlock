@@ -230,8 +230,10 @@ parse_forward() {
 
 # ---------------------------------------------------------------- network
 
+# awk reads netstat to the end: exiting early can SIGPIPE netstat, and with
+# pipefail that ends the guard (#45).
 physical_iface() {
-  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ { print $4; exit }'
+  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ && !n++ { print $4 }'
 }
 
 # Tests feed a recorded ifconfig output through TUNLOCK_TEST_IFCONFIG.
@@ -240,7 +242,7 @@ ifconfig_dump() {
 }
 
 physical_gateway() {
-  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ { print $2; exit }'
+  netstat -rn -f inet | awk '$1 == "default" && $4 ~ /^en[0-9]+$/ && !n++ { print $2 }'
 }
 
 # The utun number changes between connects, so find it by its address.
@@ -1031,7 +1033,7 @@ guard_tick() {
   if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
   G_PF_RULES=$(pf_rule_count)
   if pf_anchor_reachable; then G_PF_REACHABLE=1; else G_PF_REACHABLE=0; fi
-  G_CONFLICT=$(pf_conflicts | head -3 | paste -sd ';' -)
+  G_CONFLICT=$(pf_conflicts | awk 'NR <= 3' | paste -sd ';' -)  # not head: see physical_iface
   pf_rules_live || G_ERROR=${G_ERROR:-"anchor rules missing"}
 }
 
