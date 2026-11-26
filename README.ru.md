@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · приложение в строке меню + CLI · MIT · <b>0.1.0 preview</b> · <a href="README.md">English</a>
+  macOS 14+ · приложение в строке меню + CLI · MIT · <b>0.8.0</b> · <a href="README.md">English</a>
 </p>
 
 <p align="center">
