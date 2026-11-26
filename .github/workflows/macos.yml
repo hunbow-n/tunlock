@@ -103,8 +103,12 @@ jobs:
           echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
           echo "TUNLOCK_BUILD_VERSION=$version" >> "$GITHUB_ENV"
 
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      # The system Bash 3.2, the one tunlock runs under on every Mac.
       - name: Run tests
-        run: bash tests/run.sh
+        run: /bin/bash tests/run.sh
 
       - name: Build universal macOS app
         run: |
