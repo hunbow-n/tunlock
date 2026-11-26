@@ -365,9 +365,12 @@ render_ai_block() {
 
 rules_label() { awk -F'"' '/label "tunlock-/ { l = $2 } END { print l }' <<< "$1"; }
 
-pf_enabled() { pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; }
-pf_has_label() { [[ -n $1 ]] && pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -qF "label \"$1\""; }
-pf_rules_live() { pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'label "tunlock-'; }
+# Read pfctl to the end before matching: grep -q stops at its match, a long
+# ruleset then SIGPIPEs pfctl, and with pipefail a match reads as "no" (#45).
+pf_anchor_rules() { pfctl -a "$PF_ANCHOR" -sr 2>/dev/null; }
+pf_enabled() { local out; out=$(pfctl -s info 2>/dev/null) || return 1; grep -q '^Status: Enabled' <<< "$out"; }
+pf_has_label() { local out; [[ -n $1 ]] && out=$(pf_anchor_rules) && grep -qF "label \"$1\"" <<< "$out"; }
+pf_rules_live() { local out; out=$(pf_anchor_rules) || return 1; grep -q 'label "tunlock-' <<< "$out"; }
 pf_rule_count() { pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -c . || true; }
 
 # Our anchor only runs if the root ruleset reaches it.
