@@ -140,7 +140,7 @@ enum MCPServer {
     /// The installed config as an allowlist of fields.
     static func settingsSummary(_ c: TunConfig) -> [String: Any] {
         var d: [String: Any] = [
-            "upstream": c.upstream, "tun_addr": c.tunAddr, "tun_mask": c.tunMask, "tun_service": c.tunService,
+            "upstream": c.upstream, "tun_addr": c.tunAddr, "tun_mask": c.tunMask, "tun_service": c.tunService, "tun_engine": c.builtinTun ? "sing-box" : "app",
             "exit_mode": c.exitMode.rawValue, "expected_egress": c.expectedEgress, "expected_country": c.expectedCountry,
             "bypass_nets": c.bypassNets, "bypass_dns": c.bypassDNS.map { "\($0.domain)=\($0.server)" },
         ]

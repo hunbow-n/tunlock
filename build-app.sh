@@ -48,9 +48,11 @@ cp app/Resources/AppIcon.icns "$APP/Contents/Resources/"
 B=$APP/Contents/Resources/backend
 sed "s/^VERSION=.*/VERSION=$VERSION/" bin/tunlock > "$B/bin/tunlock"
 lipo -create "$TMP/sleepwatch-arm64" "$TMP/sleepwatch-x86_64" -output "$B/bin/tunlock-sleepwatch"
+# The built-in TUN engine: pinned sing-box release, checked by SHA-256.
+bash tools/fetch-sing-box.sh "$B/bin"
 cp install.sh uninstall.sh tunlock.conf.example "$B/"
 cp launchd/*.plist "$B/launchd/"
-chmod 755 "$B/bin/tunlock" "$B/bin/tunlock-sleepwatch" "$B/install.sh" "$B/uninstall.sh"
+chmod 755 "$B/bin/tunlock" "$B/bin/tunlock-sleepwatch" "$B/bin/sing-box" "$B/install.sh" "$B/uninstall.sh"
 codesign --force --deep --sign - "$APP"
 echo "Built $APP"
 echo "Install: cp -R \"$APP\" /Applications/ && open /Applications/Tunlock.app"

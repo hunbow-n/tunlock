@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>tunlock.tun</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>@PREFIX@/libexec/tunlock/tunlock</string>
+		<string>tun-run</string>
+	</array>
+	<!-- Started only by the guard, behind confirmed pf rules. Restarted after a
+	     crash; a clean exit (tunlock off, protection off) stays stopped. -->
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/tunlock-tun.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/tunlock-tun.log</string>
+</dict>
+</plist>

@@ -1,0 +1,4 @@
+#!/bin/bash
+# sing-box stand-in: records its calls. $STUB/singbox_reject makes check fail.
+echo "$*" >> "$STUB/sing-box.log"
+[[ $1 != check || ! -e $STUB/singbox_reject ]]

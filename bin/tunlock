@@ -24,6 +24,7 @@ AI_HOSTS=${TUNLOCK_AI_HOSTS:-"claude.ai api.anthropic.com chatgpt.com"}
 AI_APPS=${TUNLOCK_AI_APPS:-"claude Claude codex ChatGPT Cursor"}
 GUARD_LABEL=tunlock.guard
 SSH_LABEL=tunlock.ssh
+TUN_LABEL=tunlock.tun  # the built-in sing-box TUN (TUN_ENGINE=sing-box)
 TICK=2
 
 die() { echo "tunlock: $*" >&2; exit 1; }
@@ -37,7 +38,7 @@ is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # ---------------------------------------------------------------- config
 
-CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS AI_NETS TUN_ADDR TUN_MASK TUN_SERVICE EXPECTED_EGRESS EXPECTED_COUNTRY PROBE_URL PROBE_INTERVAL PF_ANCHOR'
+CONFIG_KEYS='UPSTREAM PROXY_HOST PROXY_PORT VPS_IP SSH_HOST SSH_PORT SSH_USER SSH_IDENTITY SSH_FORWARD JUMP_HOST JUMP_USER JUMP_PORT BYPASS_NETS BYPASS_DNS AI_NETS TUN_ADDR TUN_MASK TUN_SERVICE TUN_ENGINE SINGBOX_OUTBOUND EXPECTED_EGRESS EXPECTED_COUNTRY PROBE_URL PROBE_INTERVAL PF_ANCHOR'
 
 # Parse KEY=value lines without sourcing: the guard runs as root.
 load_config() {
@@ -110,12 +111,37 @@ parse_common() {
   # optional; when set, on/off also start and stop it.
   [[ -z $TUN_SERVICE || $TUN_SERVICE =~ ^[A-Za-z0-9\ ._()-]+$ ]] || die "TUN_SERVICE: use the name from scutil --nc list"
   [[ -z $TUN_MASK || $TUN_MASK =~ ^0x[0-9a-f]{8}$ ]] || die "TUN_MASK must look like 0xfffffffc"
+  parse_engine
   TUN_NET=$(tun_net "$TUN_MASK")
   [[ $PROBE_INTERVAL =~ ^[0-9]+$ ]] && (( PROBE_INTERVAL >= 5 )) || die "PROBE_INTERVAL must be >= 5"
   [[ $PF_ANCHOR =~ ^[A-Za-z0-9._/-]+$ ]] || die "PF_ANCHOR is invalid"
   PROBE_IP=''
   [[ $PROBE_URL =~ ^https://([0-9.]+)(/[A-Za-z0-9._/~-]*)?$ ]] && PROBE_IP=${BASH_REMATCH[1]}
   is_ipv4 "$PROBE_IP" || die "PROBE_URL must be https:// with an IPv4 literal host"
+}
+
+# Who brings the utun up:
+#   TUN_ENGINE=app       (default) an external TUN app, optionally TUN_SERVICE
+#   TUN_ENGINE=sing-box  the sing-box shipped with tunlock, run by launchd as
+#                        tunlock.tun and started only by the guard
+# sing-box reaches the outside through SOCKS on an SSH -D forward, or through
+# the outbound in SINGBOX_OUTBOUND (a root-only JSON file: it holds the proxy's
+# protocol and credentials, which never go into tunlock.conf).
+parse_engine() {
+  : "${TUN_ENGINE:=app}"
+  case $TUN_ENGINE in
+    app) return 0 ;;
+    sing-box) ;;
+    *) die "TUN_ENGINE must be app or sing-box" ;;
+  esac
+  [[ -z $TUN_SERVICE ]] || die "TUN_SERVICE names an external TUN app: leave it empty with TUN_ENGINE=sing-box"
+  : "${TUN_MASK:=0xfffffffc}"
+  (( $(mask_bits "$TUN_MASK") <= 30 )) || die "TUN_MASK: sing-box needs at least a /30 (0xfffffffc)"
+  if [[ -n $SINGBOX_OUTBOUND ]]; then
+    [[ $SINGBOX_OUTBOUND =~ ^/[A-Za-z0-9._/-]+$ ]] || die "SINGBOX_OUTBOUND: use an absolute path without spaces"
+  elif [[ $UPSTREAM != ssh || ${FORWARD_FIRST:-} != -D ]]; then
+    die "TUN_ENGINE=sing-box needs SSH_FORWARD starting with -D, or SINGBOX_OUTBOUND with the proxy's outbound"
+  fi
 }
 
 # What a verified exit is:
@@ -207,6 +233,7 @@ parse_forward() {
   read -r -a words <<< "$SSH_FORWARD"
   (( ${#words[@]} >= 2 && ${#words[@]} % 2 == 0 )) || die "SSH_FORWARD needs -L or -D options"
   FORWARD_ARGS=()
+  FORWARD_FIRST=''
   HEALTH_HOST=''
   HEALTH_PORT=''
   for (( i = 0; i < ${#words[@]}; i += 2 )); do
@@ -216,6 +243,7 @@ parse_forward() {
     [[ $spec =~ ^[A-Za-z0-9._:-]+$ ]] || die "SSH_FORWARD: invalid spec $spec"
     FORWARD_ARGS+=("$opt" "$spec")
     [[ -z $HEALTH_PORT ]] || continue
+    FORWARD_FIRST=$opt
     local f
     IFS=: read -r -a f <<< "$spec"
     case "$opt:${#f[@]}" in
@@ -269,6 +297,105 @@ tun_net() {
   local x=$m
   while (( x & 0x80000000 )); do bits=$((bits + 1)); x=$(( (x << 1) & 0xffffffff )); done
   echo "$(( a & (m >> 24 & 255) )).$(( b & (m >> 16 & 255) )).$(( c & (m >> 8 & 255) )).$(( d & (m & 255) ))/$bits"
+}
+
+mask_bits() { # hex netmask -> prefix length
+  local x=$(( 16#${1#0x} )) bits=0
+  while (( x & 0x80000000 )); do bits=$((bits + 1)); x=$(( (x << 1) & 0xffffffff )); done
+  echo "$bits"
+}
+
+# ---------------------------------------------------------------- sing-box
+
+singbox_bin() { echo "${TUNLOCK_SINGBOX:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/sing-box}"; }
+tun_managed() { [[ $TUN_ENGINE == sing-box ]]; }
+# A TUN client tunlock starts and stops: the built-in one or a named VPN service.
+tun_client_set() { tun_managed || [[ -n $TUN_SERVICE ]]; }
+
+json_list() { # items -> "a", "b"
+  local out='' item
+  for item in "$@"; do out+="${out:+, }\"$item\""; done
+  echo "$out"
+}
+
+# The sing-box config for the current settings. Every value in it was
+# validated by load_config (addresses, ports, paths), so nothing needs escaping.
+# Routes for the entry and the exceptions stay outside the utun, as pf allows
+# them directly; DNS goes through the tunnel; pf remains the lock either way.
+render_singbox() {
+  local outbound exclude t
+  if [[ -n $SINGBOX_OUTBOUND ]]; then
+    [[ -r $SINGBOX_OUTBOUND ]] || die "SINGBOX_OUTBOUND: cannot read $SINGBOX_OUTBOUND"
+    grep -Eq '"tag"[[:space:]]*:[[:space:]]*"proxy"' "$SINGBOX_OUTBOUND" \
+      || die "SINGBOX_OUTBOUND: the outbound needs \"tag\": \"proxy\""
+    outbound=$(cat "$SINGBOX_OUTBOUND")
+  else
+    # SSH -D forwards TCP only: UDP is refused rather than sent elsewhere.
+    outbound="{ \"type\": \"socks\", \"tag\": \"proxy\", \"server\": \"$HEALTH_HOST\", \"server_port\": $HEALTH_PORT, \"version\": \"5\", \"network\": \"tcp\" }"
+  fi
+  local -a ex=("$ENTRY_HOST/32")
+  while IFS= read -r t; do ex+=("$t"); done < <(bypass_targets)
+  exclude=$(json_list "${ex[@]}")
+  cat <<EOF
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [ { "type": "tcp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy" } ],
+    "final": "remote",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun",
+      "address": [ "$TUN_ADDR/$(mask_bits "$TUN_MASK")" ],
+      "auto_route": true,
+      "dns_mode": "hijack",
+      "route_exclude_address": [ $exclude ],
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    $outbound,
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" }
+    ],
+    "final": "proxy"
+  }
+}
+EOF
+}
+
+# launchd runs this as tunlock.tun. Only while protection is asked for: pf
+# rules come first, and the guard is the one that starts the job.
+cmd_tun_run() {
+  require_root
+  load_config
+  tun_managed || die "TUN_ENGINE is not sing-box"
+  [[ $(read_mode) == protected ]] || { log "tun: protection is off, sing-box not started"; exit 0; }
+  local bin cfg own
+  bin=$(singbox_bin)
+  [[ -x $bin ]] || die "sing-box is not installed at $bin: run install.sh"
+  if [[ -n $SINGBOX_OUTBOUND && -z ${TUNLOCK_TEST_PATH:-} ]]; then
+    # It holds credentials and becomes part of what root runs.
+    own=$(stat -f '%u %Lp' "$SINGBOX_OUTBOUND") || die "SINGBOX_OUTBOUND: cannot stat $SINGBOX_OUTBOUND"
+    [[ $own =~ ^0\ [0-7]00$ ]] || die "SINGBOX_OUTBOUND must belong to root with mode 600 (now: uid/mode $own)"
+  fi
+  mkdir -p "$RUN_DIR/sing-box"
+  cfg=$RUN_DIR/sing-box.json
+  ( umask 077; render_singbox > "$cfg.tmp" ) && mv -f "$cfg.tmp" "$cfg"
+  "$bin" check -c "$cfg" || die "sing-box rejected its config ($cfg)"
+  exec "$bin" run -c "$cfg" -D "$RUN_DIR/sing-box"
+}
+
+tun_client_start() {
+  if tun_managed; then launchctl kickstart "system/$TUN_LABEL" >/dev/null 2>&1 || true
+  else as_console_user scutil --nc start "$SVC_REF" >/dev/null 2>&1 || true
+  fi
 }
 
 # Ask a fixed IP (no DNS) which address we come from, through the tunnel.
@@ -977,7 +1104,7 @@ guard_tick() {
   fi
   if (( ! fwd )); then G_SVC_LEFT=3 G_SVC_HELD=''
   elif [[ -n $tun ]]; then G_SVC_LEFT=0
-  elif [[ -n $TUN_SERVICE && $sleeping == 0 && $rules_ok == 1 && $G_ARMED == 1 && -z $G_ERROR ]] \
+  elif tun_client_set && [[ $sleeping == 0 && $rules_ok == 1 && $G_ARMED == 1 && -z $G_ERROR ]] \
     && (( G_SVC_LEFT > 0 && now - G_SVC_AT >= 60 * (3 - G_SVC_LEFT) )) \
     && [[ $G_SVC_HELD != svc || -z $G_SVC_WARN ]]; then  # a missing service waits for the minute check
     # The same checks as the verdict, right now: pf on, the anchor reached,
@@ -996,13 +1123,13 @@ guard_tick() {
       else
         G_SVC_HELD='' G_SVC_LEFT=$((G_SVC_LEFT - 1))
         log "the forward is up but no tunnel is: starting $SVC_NAME"
-        as_console_user scutil --nc start "$SVC_REF" >/dev/null 2>&1 || true
+        tun_client_start
         (( G_SVC_LEFT > 0 )) || log "$SVC_NAME did not bring a tunnel up; start it yourself"
       fi
     fi
   fi
   # A configured TUN app that no longer exists is shown, checked once a minute.
-  if [[ -n $TUN_SERVICE ]] && (( now - G_SVC_CHECK_AT >= 60 )); then
+  if tun_client_set && (( now - G_SVC_CHECK_AT >= 60 )); then
     G_SVC_CHECK_AT=$now
     resolve_tun_service
     G_SVC_WARN=$SVC_WARN
@@ -1338,7 +1465,7 @@ cmd_protect() {
   done
   v=$(compute_verdict)
   # Rules confirmed first, so the TUN client can only come up behind them.
-  if [[ ( $v == protected || $v == blocked ) && -n $TUN_SERVICE ]]; then
+  if [[ $v == protected || $v == blocked ]] && tun_client_set; then
     resolve_tun_service
     if [[ -n $SVC_WARN ]]; then
       echo "tunlock: $SVC_WARN" >&2
@@ -1482,6 +1609,11 @@ provider_live() { # UUID of a VPN service
 
 resolve_tun_service() {
   SVC_REF=$TUN_SERVICE SVC_NAME=$TUN_SERVICE SVC_WARN=''
+  if tun_managed; then
+    SVC_REF=$TUN_LABEL SVC_NAME="the built-in sing-box"
+    [[ -x $(singbox_bin) ]] || SVC_WARN="the built-in sing-box is not installed: run install.sh again"
+    return 0
+  fi
   [[ -n $TUN_SERVICE ]] || return 0
   local list exact='' exact_app='' name uuid app
   local -a cand=() cand_name=() similar=()
@@ -1520,7 +1652,8 @@ stop_keeper_and_service() {
   uid=$(console_uid)
   # Restarted, the keeper sees mode off and idles without holding the port.
   launchctl kickstart -k "gui/$uid/$SSH_LABEL" >/dev/null 2>&1 || true
-  if [[ -n $TUN_SERVICE ]]; then resolve_tun_service; as_console_user scutil --nc stop "$SVC_REF" >/dev/null 2>&1 || true; fi
+  if tun_managed; then launchctl kill SIGTERM "system/$TUN_LABEL" >/dev/null 2>&1 || true
+  elif [[ -n $TUN_SERVICE ]]; then resolve_tun_service; as_console_user scutil --nc stop "$SVC_REF" >/dev/null 2>&1 || true; fi
 }
 
 # The guard's reason, unless its state is too old to say anything.
@@ -1927,6 +2060,10 @@ cmd_doctor() {
   fi
   load_config
   guard_running && item ok "guard running ($GUARD_LABEL)" || item bad "guard not loaded ($GUARD_LABEL)"
+  if tun_managed; then
+    [[ -x $(singbox_bin) ]] && item ok "built-in sing-box at $(singbox_bin)" || item bad "built-in sing-box missing: run install.sh"
+    launchctl print "system/$TUN_LABEL" >/dev/null 2>&1 && item ok "TUN job loaded ($TUN_LABEL)" || item bad "TUN job not loaded ($TUN_LABEL): run install.sh"
+  fi
   local tun
   if [[ $UPSTREAM == proxy ]]; then
     tun=$(find_tun || true)
@@ -1994,6 +2131,7 @@ tunlock $VERSION: SSH tunnel keeper with a pf kill switch for macOS
   tunlock config      print the effective configuration
   tunlock ssh-command print the ssh command the keeper runs, change nothing
   tunlock render-rules block|probe|open [utunN [enN]]   print pf rules, change nothing
+  tunlock render-singbox  print the built-in sing-box config, change nothing
 
 Config: $CONF
 EOF
@@ -2029,6 +2167,8 @@ main() {
       load_config
       [[ $UPSTREAM != proxy ]] || { echo "none: UPSTREAM=proxy runs no SSH"; exit 0; }
       build_ssh_args "$(physical_iface)"; printf '%q ' "${SSH_ARGS[@]}"; echo ;;
+    render-singbox) load_config; tun_managed || die "TUN_ENGINE is not sing-box"; render_singbox ;;
+    tun-run) cmd_tun_run ;;
     render-rules) load_config; render_rules "${1:-block}" "${2:-}" "${3-$(physical_iface)}" ;;
     config) load_config; cmd_config ;;
     version | --version) echo "tunlock $VERSION" ;;

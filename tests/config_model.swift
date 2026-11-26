@@ -54,6 +54,15 @@ enum ConfigModelTests {
         let cr = LeakOutput("PASS a\rSKIP ipv6 no baseline\rUNCONFIRMED=ipv6\rRESULT=pass\r")
         check("leak test: CR line breaks keep UNCONFIRMED", cr.unconfirmed == ["ipv6"] && cr.result == "pass")
         check("leak test: metadata is not shown as lines", cr.lines == ["PASS a", "SKIP ipv6 no baseline"])
+        var sb = TunConfig()
+        sb.vpsIP = "203.0.113.10"; sb.tunAddr = "10.20.0.1"; sb.tunMask = "0xfffffffc"; sb.forward = .socks; sb.localPort = "1080"
+        sb.builtinTun = true; sb.tunService = "Karing"
+        let sbr = sb.render()
+        check("built-in TUN: writes TUN_ENGINE and no TUN_SERVICE", sbr.contains("TUN_ENGINE=sing-box") && sbr.contains("TUN_SERVICE=\"\"\n"))
+        check("built-in TUN: TUN_ENGINE is not carried as an extra", !sbr.contains("TUN_ENGINE=\"sing-box\""))
+        let sbBack = TunConfig.parse(sbr + "SINGBOX_OUTBOUND=/usr/local/etc/tunlock-outbound.json\n")
+        check("built-in TUN: round trip keeps it and SINGBOX_OUTBOUND", sbBack.builtinTun && sbBack.render().contains("SINGBOX_OUTBOUND=\"/usr/local/etc/tunlock-outbound.json\""))
+        check("built-in TUN: off by default", !TunConfig.parse(c.render()).builtinTun)
         let lf = LeakOutput("PASS a\nUNCONFIRMED=ipv4 udp\nRESULT=pass\n")
         check("leak test: LF line breaks too", lf.unconfirmed == ["ipv4", "udp"] && lf.lines == ["PASS a"])
         exit(failures == 0 ? 0 : 1)

@@ -403,6 +403,22 @@ struct SettingsView: View {
                     TextField("SSH_FORWARD", text: $config.customForward, prompt: Text("-L 127.0.0.1:1080:127.0.0.1:8388"))
                 }
             }
+            Toggle(L("Built-in TUN (sing-box), no TUN app needed", "Встроенный TUN (sing-box), без TUN-приложения"), isOn: $config.builtinTun)
+                .onChange(of: config.builtinTun) { on in
+                    guard on else { return }
+                    config.tunService = ""
+                    if config.tunAddr.isEmpty { config.tunAddr = "10.20.0.1" }
+                    config.tunMask = "0xfffffffc"
+                }
+            if config.builtinTun {
+                TextField(L("TUN address", "Адрес TUN"), text: $config.tunAddr, prompt: Text("10.20.0.1"))
+                Text(config.isProxy || config.forward != .socks
+                     ? L("Tunlock starts sing-box itself. For a proxy or a -L forward, put the sing-box outbound tagged \"proxy\" in a root-only file and set SINGBOX_OUTBOUND (see README).",
+                         "Tunlock сам запускает sing-box. Для прокси или проброса -L положите outbound sing-box с тегом \"proxy\" в файл только для root и укажите SINGBOX_OUTBOUND (см. README).")
+                     : L("Tunlock starts sing-box itself and sends traffic into the SSH SOCKS forward. TCP only.",
+                         "Tunlock сам запускает sing-box и отправляет трафик в SOCKS-проброс SSH. Только TCP."))
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
             Picker(L("TUN app to start and stop", "TUN-приложение (вкл/выкл вместе с Tunlock)"), selection: $config.tunService) {
                 Text(L("Don't control", "Не управлять")).tag("")
                 ForEach(vpnServices(), id: \.self) { Text($0).tag($0) }
@@ -427,6 +443,7 @@ struct SettingsView: View {
             // Until an interface is chosen, keep looking: turning the TUN app on is enough.
             .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
                 if config.tunAddr.isEmpty { rescanTuns() }
+            }
             }
             tunStatus
         } header: {

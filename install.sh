@@ -54,6 +54,12 @@ install -o root -g wheel -m 755 "$SRC/bin/tunlock" "$PREFIX/libexec/tunlock/tunl
 if [[ -x $SRC/bin/tunlock-sleepwatch ]]; then
   install -o root -g wheel -m 755 "$SRC/bin/tunlock-sleepwatch" "$PREFIX/libexec/tunlock/tunlock-sleepwatch"
 fi
+# The built-in TUN (TUN_ENGINE=sing-box): sing-box ships with the app
+# (build-app.sh), unmodified, with its GPLv3 license and source link.
+if [[ -x $SRC/bin/sing-box ]]; then
+  install -o root -g wheel -m 755 "$SRC/bin/sing-box" "$PREFIX/libexec/tunlock/sing-box"
+  install -o root -g wheel -m 644 "$SRC/bin/sing-box.LICENSE" "$SRC/bin/sing-box.NOTICE" "$PREFIX/libexec/tunlock/"
+fi
 ln -sfn "$PREFIX/libexec/tunlock/tunlock" "$PREFIX/bin/tunlock"
 
 CONF=$PREFIX/etc/tunlock.conf
@@ -72,6 +78,14 @@ chmod 644 "$CONF"
 # Root guard: owns pf. Mode starts as direct unless one was chosen before.
 install -d -o root -g wheel -m 755 /var/db/tunlock
 [[ -e /var/db/tunlock/mode ]] || echo direct > /var/db/tunlock/mode
+# The built-in TUN job loads before the guard restarts: a fresh guard then
+# sees no tunnel and starts it once pf rules are confirmed. It never starts on load.
+if [[ -x $PREFIX/libexec/tunlock/sing-box ]]; then
+  sed "s|@PREFIX@|$PREFIX|g" "$SRC/launchd/tunlock.tun.plist" > /Library/LaunchDaemons/tunlock.tun.plist
+  chown root:wheel /Library/LaunchDaemons/tunlock.tun.plist
+  chmod 644 /Library/LaunchDaemons/tunlock.tun.plist
+  reload_job system tunlock.tun /Library/LaunchDaemons/tunlock.tun.plist
+fi
 sed "s|@PREFIX@|$PREFIX|g" "$SRC/launchd/tunlock.guard.plist" > /Library/LaunchDaemons/tunlock.guard.plist
 chown root:wheel /Library/LaunchDaemons/tunlock.guard.plist
 chmod 644 /Library/LaunchDaemons/tunlock.guard.plist
