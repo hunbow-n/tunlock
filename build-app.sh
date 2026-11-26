@@ -42,17 +42,20 @@ lipo -create "$TMP/Tunlock-arm64" "$TMP/Tunlock-x86_64" -output "$APP/Contents/M
 for arch in arm64 x86_64; do
   swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" ${FLAGS[@]+"${FLAGS[@]}"} -framework IOKit \
     app/Helpers/SleepWatch.swift -o "$TMP/sleepwatch-$arch"
+  swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" ${FLAGS[@]+"${FLAGS[@]}"} -framework SystemConfiguration \
+    app/Helpers/TUNResolver.swift -o "$TMP/tun-dns-$arch"
 done
 sed "s/@VERSION@/$VERSION/g" app/Info.plist > "$APP/Contents/Info.plist"
 cp app/Resources/AppIcon.icns "$APP/Contents/Resources/"
 B=$APP/Contents/Resources/backend
 sed "s/^VERSION=.*/VERSION=$VERSION/" bin/tunlock > "$B/bin/tunlock"
 lipo -create "$TMP/sleepwatch-arm64" "$TMP/sleepwatch-x86_64" -output "$B/bin/tunlock-sleepwatch"
+lipo -create "$TMP/tun-dns-arm64" "$TMP/tun-dns-x86_64" -output "$B/bin/tunlock-tun-dns"
 # The built-in TUN engine: pinned sing-box release, checked by SHA-256.
 bash tools/fetch-sing-box.sh "$B/bin"
 cp install.sh uninstall.sh tunlock.conf.example "$B/"
 cp launchd/*.plist "$B/launchd/"
-chmod 755 "$B/bin/tunlock" "$B/bin/tunlock-sleepwatch" "$B/bin/sing-box" "$B/install.sh" "$B/uninstall.sh"
+chmod 755 "$B/bin/tunlock" "$B/bin/tunlock-sleepwatch" "$B/bin/tunlock-tun-dns" "$B/bin/sing-box" "$B/install.sh" "$B/uninstall.sh"
 codesign --force --deep --sign - "$APP"
 echo "Built $APP"
 echo "Install: cp -R \"$APP\" /Applications/ && open /Applications/Tunlock.app"

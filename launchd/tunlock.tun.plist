@@ -10,8 +10,9 @@
 		<string>@PREFIX@/libexec/tunlock/tunlock</string>
 		<string>tun-run</string>
 	</array>
-	<!-- Started only by the guard, behind confirmed pf rules. Restarted after a
-	     crash; a clean exit (tunlock off, protection off) stays stopped. -->
+	<!-- Started by the guard behind confirmed pf rules (launchd may also run it
+	     once on load). Restarted after a crash; a clean exit (external TUN app,
+	     tunlock off, protection off) stays stopped. -->
 	<key>RunAtLoad</key>
 	<false/>
 	<key>KeepAlive</key>

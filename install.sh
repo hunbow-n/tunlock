@@ -58,6 +58,9 @@ fi
 # (build-app.sh), unmodified, with its GPLv3 license and source link.
 if [[ -x $SRC/bin/sing-box ]]; then
   install -o root -g wheel -m 755 "$SRC/bin/sing-box" "$PREFIX/libexec/tunlock/sing-box"
+  # Registers the utun's DNS with macOS for as long as sing-box runs.
+  [[ -x $SRC/bin/tunlock-tun-dns ]] || die "tunlock-tun-dns is missing next to sing-box: build the app with build-app.sh"
+  install -o root -g wheel -m 755 "$SRC/bin/tunlock-tun-dns" "$PREFIX/libexec/tunlock/tunlock-tun-dns"
   install -o root -g wheel -m 644 "$SRC/bin/sing-box.LICENSE" "$SRC/bin/sing-box.NOTICE" "$PREFIX/libexec/tunlock/"
 fi
 ln -sfn "$PREFIX/libexec/tunlock/tunlock" "$PREFIX/bin/tunlock"
@@ -79,7 +82,9 @@ chmod 644 "$CONF"
 install -d -o root -g wheel -m 755 /var/db/tunlock
 [[ -e /var/db/tunlock/mode ]] || echo direct > /var/db/tunlock/mode
 # The built-in TUN job loads before the guard restarts: a fresh guard then
-# sees no tunnel and starts it once pf rules are confirmed. It never starts on load.
+# sees no tunnel and starts it once pf rules are confirmed. launchd may run it
+# once on load; tun-run then exits at once unless TUN_ENGINE=sing-box and
+# protection is on, and pf keeps everything closed until the exit is verified.
 if [[ -x $PREFIX/libexec/tunlock/sing-box ]]; then
   sed "s|@PREFIX@|$PREFIX|g" "$SRC/launchd/tunlock.tun.plist" > /Library/LaunchDaemons/tunlock.tun.plist
   chown root:wheel /Library/LaunchDaemons/tunlock.tun.plist

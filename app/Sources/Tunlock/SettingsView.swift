@@ -445,17 +445,19 @@ struct SettingsView: View {
                 if config.tunAddr.isEmpty { rescanTuns() }
             }
             }
-            tunStatus
+            if config.builtinTun { builtinTunStatus } else { tunStatus }
         } header: {
             Text(L("Tunnel", "Туннель"))
         } footer: {
-            FooterText(config.isProxy
-                 ? L("Turn your TUN app on with the proxy profile, in TUN mode. Tunlock spots its interface and asks you to confirm it.",
-                     "Включите TUN-приложение с профилем прокси в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить.")
-                 : config.forward == .custom
-                 ? L("Only -L and -D are accepted.", "Допускаются только -L и -D.")
-                 : L("In your TUN app, point the proxy at 127.0.0.1:\(config.localPort) and turn it on in TUN mode. Tunlock spots its interface and asks you to confirm it.",
-                     "В TUN-приложении укажите прокси 127.0.0.1:\(config.localPort) и включите его в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить."))
+            if !config.builtinTun {
+                FooterText(config.isProxy
+                     ? L("Turn your TUN app on with the proxy profile, in TUN mode. Tunlock spots its interface and asks you to confirm it.",
+                         "Включите TUN-приложение с профилем прокси в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить.")
+                     : config.forward == .custom
+                     ? L("Only -L and -D are accepted.", "Допускаются только -L и -D.")
+                     : L("In your TUN app, point the proxy at 127.0.0.1:\(config.localPort) and turn it on in TUN mode. Tunlock spots its interface and asks you to confirm it.",
+                         "В TUN-приложении укажите прокси 127.0.0.1:\(config.localPort) и включите его в режиме TUN. Tunlock заметит его интерфейс и попросит подтвердить."))
+            }
         }
     }
 
@@ -633,6 +635,7 @@ struct SettingsView: View {
             return (L("Enter your server's IP", "Укажите IP сервера"), .connection)
         }
         if config.tunAddr.isEmpty {
+            if config.builtinTun { return (L("Enter the TUN address", "Укажите адрес TUN"), .connection) }
             return (L("Turn the TUN app on in TUN mode and confirm its interface", "Включите TUN-приложение в режиме TUN и подтвердите его интерфейс"), .connection)
         }
         if config.exitMode != .ip, config.expectedCountry.count != 2 {
@@ -648,6 +651,26 @@ struct SettingsView: View {
         case .exceptions: return L("Exceptions", "Исключения")
         case .activity: return L("Activity", "Журнал")
         case .general: return L("General", "Общие")
+        }
+    }
+
+    @ViewBuilder
+    private var builtinTunStatus: some View {
+        let installed = TunConfig.loadInstalled()
+        if installed?.builtinTun != true || installed?.tunAddr != config.tunAddr {
+            Label(L("Save and apply to use this built-in configuration.", "Сохраните и примените настройки встроенного sing-box."),
+                  systemImage: "gearshape")
+                .font(.callout).foregroundStyle(.secondary)
+        } else if model.verdict == .protected, let interface = model.state["tun"], !interface.isEmpty {
+            Label(L("sing-box connected · \(interface)", "sing-box подключён · \(interface)"), systemImage: "checkmark.circle.fill")
+                .font(.callout).foregroundStyle(.green)
+        } else if model.mode == "protected" {
+            Label(model.closeReason(), systemImage: "hourglass")
+                .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        } else {
+            Label(L("Tunlock starts sing-box when protection is turned on.", "Tunlock запустит sing-box при включении защиты."),
+                  systemImage: "moon.fill")
+                .font(.callout).foregroundStyle(.secondary)
         }
     }
 

@@ -278,8 +278,13 @@ final class StatusModel: ObservableObject {
 
     private func switchMode(_ protected: Bool) {
         let cmd = protected ? "on" : "off"
-        busy = protected ? L("Turning on: firewall, then SSH and the TUN app…", "Включаю: сначала файрвол, потом SSH и TUN-приложение…")
-                         : L("Turning off…", "Выключаю…")
+        if protected {
+            busy = TunConfig.loadInstalled()?.builtinTun == true
+                ? L("Turning on: firewall, then the built-in sing-box…", "Включаю: сначала файрвол, затем встроенный sing-box…")
+                : L("Turning on: firewall, then SSH and the TUN app…", "Включаю: сначала файрвол, потом SSH и TUN-приложение…")
+        } else {
+            busy = L("Turning off…", "Выключаю…")
+        }
         message = nil
         Task {
             let r = await runCLIAsRoot(cmd)
@@ -391,16 +396,29 @@ final class StatusModel: ObservableObject {
         switch reason {
         case "sleep": return L("The Mac is going to sleep. The exit is checked again after wake.",
                                "Mac засыпает. После пробуждения выход проверится заново.")
-        case "no_tun": return L("No TUN interface. Turn on your TUN app in TUN mode.",
-                                "Нет TUN-интерфейса. Включите TUN-приложение в режиме TUN.")
+        case "no_tun":
+            if TunConfig.loadInstalled()?.builtinTun == true {
+                if s["upstream"] == "ssh", s["ssh"] != "up" {
+                    return L("Waiting for SSH. Tunlock starts sing-box when SSH connects.",
+                             "Жду SSH. Tunlock запустит sing-box, когда SSH подключится.")
+                }
+                return L("Waiting for the built-in sing-box interface.", "Жду интерфейс встроенного sing-box.")
+            }
+            return L("No TUN interface. Turn on your TUN app in TUN mode.",
+                     "Нет TUN-интерфейса. Включите TUN-приложение в режиме TUN.")
         case "entry_down":
             return L("The TCP port of \(s["entry"] ?? "the entry") does not answer. Check the proxy or server.",
                      "TCP-порт \(s["entry"] ?? "входа") недоступен. Проверьте прокси или сервер.")
         case "ssh_down": return L("SSH dropped. Waiting for it to reconnect.", "SSH отвалился. Жду переподключения.")
         case "exit_mismatch":
             return L("The exit changed to ", "Выход сменился на ") + (s["egress_ip"] ?? "") + " " + flagEmoji(s["egress_country"] ?? "")
-        case "exit_no_answer": return L("The exit check through the tunnel got no answer. Check the TUN app's connection.",
-                                        "Проверка выхода через туннель не получила ответа. Проверьте подключение TUN-приложения.")
+        case "exit_no_answer":
+            if TunConfig.loadInstalled()?.builtinTun == true {
+                return L("No response through sing-box. Tunlock will check the exit again.",
+                         "Нет ответа через sing-box. Tunlock проверит выход ещё раз.")
+            }
+            return L("The exit check through the tunnel got no answer. Check the TUN app's connection.",
+                     "Проверка выхода через туннель не получила ответа. Проверьте подключение TUN-приложения.")
         case "exit_pending": return L("Checking the exit through the tunnel…", "Проверяю выход через туннель…")
         case "pf_conflict": return L("Other firewall rules decide before Tunlock.", "Раньше Tunlock решают другие правила файрвола.")
         case "pf_error": return L("Firewall problem, see below. Run tunlock doctor.", "Сбой файрвола, подробности ниже. Запустите tunlock doctor.")

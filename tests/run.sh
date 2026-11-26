@@ -640,6 +640,8 @@ expect_eq "sing-box: tun-run checks the config, then runs it, readable by root o
 run -c $STUB/run/sing-box.json -D $STUB/run/sing-box | 600"
 rm -f "$STUB/sing-box.log"
 expect_eq "sing-box: tun-run does not start while protection is off" "$(sbrun direct) | $(cat "$STUB/sing-box.log" 2>/dev/null)" "0 | "
+expect_eq "sing-box: tun-run with an external TUN app exits cleanly, so launchd keeps it stopped" \
+  "$(echo protected > "$STUB/db/mode"; TUNLOCK_SINGBOX=$STUBS/sing-box TUNLOCK_TEST_PATH=$STUBS TUNLOCK_CONF=$F/good.conf TUNLOCK_STATE_DIR=$STUB/db TUNLOCK_RUN_DIR=$STUB/run $T tun-run >/dev/null 2>&1; echo $?) | $(cat "$STUB/sing-box.log" 2>/dev/null)" "0 | "
 : > "$STUB/singbox_reject"
 expect_eq "sing-box: a config sing-box rejects is never run" \
   "$(sbrun protected) | $(grep -c '^run ' "$STUB/sing-box.log")" "1 | 0"

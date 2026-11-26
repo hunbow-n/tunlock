@@ -308,6 +308,7 @@ mask_bits() { # hex netmask -> prefix length
 # ---------------------------------------------------------------- sing-box
 
 singbox_bin() { echo "${TUNLOCK_SINGBOX:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/sing-box}"; }
+singbox_dns_helper() { echo "${TUNLOCK_TEST_PATH:-$PREFIX/libexec/tunlock}/tunlock-tun-dns"; }
 tun_managed() { [[ $TUN_ENGINE == sing-box ]]; }
 # A TUN client tunlock starts and stops: the built-in one or a named VPN service.
 tun_client_set() { tun_managed || [[ -n $TUN_SERVICE ]]; }
@@ -375,10 +376,13 @@ EOF
 cmd_tun_run() {
   require_root
   load_config
-  tun_managed || die "TUN_ENGINE is not sing-box"
+  # KeepAlive may start this job once at bootstrap, even for an external TUN.
+  tun_managed || return 0
   [[ $(read_mode) == protected ]] || { log "tun: protection is off, sing-box not started"; exit 0; }
-  local bin cfg own
+  local bin cfg own dns_helper
   bin=$(singbox_bin)
+  dns_helper=$(singbox_dns_helper)
+  [[ -x $dns_helper ]] || die "tunlock-tun-dns is not installed; run the app installer"
   [[ -x $bin ]] || die "sing-box is not installed at $bin: run install.sh"
   if [[ -n $SINGBOX_OUTBOUND && -z ${TUNLOCK_TEST_PATH:-} ]]; then
     # It holds credentials and becomes part of what root runs.
@@ -389,7 +393,7 @@ cmd_tun_run() {
   cfg=$RUN_DIR/sing-box.json
   ( umask 077; render_singbox > "$cfg.tmp" ) && mv -f "$cfg.tmp" "$cfg"
   "$bin" check -c "$cfg" || die "sing-box rejected its config ($cfg)"
-  exec "$bin" run -c "$cfg" -D "$RUN_DIR/sing-box"
+  exec "$dns_helper" "$TUN_ADDR" "$bin" run -c "$cfg" -D "$RUN_DIR/sing-box"
 }
 
 tun_client_start() {
