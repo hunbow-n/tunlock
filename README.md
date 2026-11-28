@@ -115,6 +115,9 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
    service Tunlock starts and stops.
 4. Press **Save and apply**. One administrator prompt installs the background
    service. With **Switch modes without a password** checked, it never asks again.
+   With **Ask for the Mac password to turn off** also checked, only switching
+   off still asks, so an AI agent or a script cannot turn protection off on its
+   own. Unchecking it asks for the password too.
 5. Flip the switch in the menu bar. If AI apps are still running when you
    switch off, confirm or cancel in the Tunlock panel.
 
@@ -377,7 +380,8 @@ everything else.
 
 Without the app: `sudo ./install.sh` (the first run creates the config), edit
 the config, then run `sudo ./install.sh` again. Add `--sudoers` to switch
-without a password.
+without a password, and `--confirm-off` to keep the password for switching off.
+Each run without `--confirm-off` clears that setting.
 
 ## Testing
 

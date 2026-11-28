@@ -725,6 +725,13 @@ expect_eq "install bootstraps a job only after bootout has finished" \
   "0 4 bootstrap system /x.plist"
 rm -rf "$STUB"
 
+# ---- install: --confirm-off keeps off behind the password even with --sudoers (#60)
+eval "$(sed -n '/^sudoers_entry()/,/^}/p' install.sh)"
+expect_eq "sudoers lets off and direct run without a password by default" \
+  "$(sudoers_entry me /t 0)" "me ALL=(root) NOPASSWD: /t protect, /t on, /t test, /t direct, /t off"
+expect_eq "sudoers with --confirm-off leaves off and direct out" \
+  "$(sudoers_entry me /t 1)" "me ALL=(root) NOPASSWD: /t protect, /t on, /t test"
+
 # ---- uninstall: never delete state before pf confirms rules and reference are gone
 un_setup() {
   STUB=$(mktemp -d); export STUB

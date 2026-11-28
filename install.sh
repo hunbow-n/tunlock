@@ -1,14 +1,24 @@
 #!/bin/bash
 # Install tunlock: root guard (LaunchDaemon) + per-user SSH keeper (LaunchAgent).
-# Usage: sudo ./install.sh [--sudoers] [--user NAME]
-#   --sudoers  let the user switch modes and run the leak test without a password
-#              (without it, an existing passwordless entry is removed)
+# Usage: sudo ./install.sh [--sudoers] [--confirm-off] [--user NAME]
+#   --sudoers      let the user switch modes and run the leak test without a password
+#                  (without it, an existing passwordless entry is removed)
+#   --confirm-off  turning protection off always asks for the Mac password, even
+#                  with --sudoers: an agent or script cannot do it on its own
+#                  (without it, the setting is cleared)
 #   --user     account that owns the SSH key (default: the one that ran sudo)
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 PREFIX=/usr/local
 SRC=$(cd "$(dirname "$0")" && pwd -P)
 die() { echo "install: $*" >&2; exit 1; }
+# The passwordless entry. With --confirm-off it leaves out direct and off, so
+# sudo asks for the password there and sudo -n fails.
+sudoers_entry() { # user cli confirm_off
+  local cmds="$2 protect, $2 on, $2 test"
+  (( $3 )) || cmds+=", $2 direct, $2 off"
+  echo "$1 ALL=(root) NOPASSWD: $cmds"
+}
 # Reload a launchd job. bootout returns before launchd has dropped the job, and
 # a bootstrap in that window fails with "Bootstrap failed: 5" (#37): wait it out.
 reload_job() { # domain, label, plist
@@ -21,9 +31,11 @@ reload_job() { # domain, label, plist
 [[ $EUID == 0 ]] || die "run with sudo"
 USER_NAME=${SUDO_USER:-}
 SUDOERS=0
+CONFIRM_OFF=0
 while (( $# )); do
   case $1 in
     --sudoers) SUDOERS=1 ;;
+    --confirm-off) CONFIRM_OFF=1 ;;
     --user) USER_NAME=${2:-}; shift ;;
     *) die "unknown option $1" ;;
   esac
@@ -110,12 +122,18 @@ reload_job "gui/$USER_UID" tunlock.ssh "$AGENT"
 if (( SUDOERS )); then
   tmp=$(mktemp)
   cli=$PREFIX/libexec/tunlock/tunlock
-  echo "$USER_NAME ALL=(root) NOPASSWD: $cli protect, $cli direct, $cli on, $cli off, $cli test" > "$tmp"
+  sudoers_entry "$USER_NAME" "$cli" "$CONFIRM_OFF" > "$tmp"
   visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers entry rejected"; }
   install -o root -g wheel -m 440 "$tmp" /etc/sudoers.d/tunlock
   rm -f "$tmp"
 else
   rm -f /etc/sudoers.d/tunlock
+fi
+# Marks the setting for the app, written only after the sudoers entry matches it.
+if (( CONFIRM_OFF )); then
+  install -o root -g wheel -m 644 /dev/null /var/db/tunlock/confirm-off
+else
+  rm -f /var/db/tunlock/confirm-off
 fi
 
 echo "Installed. Mode: $(cat /var/db/tunlock/mode). Next:"

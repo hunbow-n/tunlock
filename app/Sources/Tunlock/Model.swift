@@ -329,7 +329,8 @@ final class StatusModel: ObservableObject {
     }
 
     /// Writes the config as root and (re)installs the bundled backend.
-    func apply(_ config: TunConfig, passwordless: Bool) async -> String? {
+    func apply(_ config: TunConfig, passwordless: Bool,
+               confirmOff: Bool = FileManager.default.fileExists(atPath: Paths.confirmOff)) async -> String? {
         if let error = await config.validate() { return error }
         let tmp = NSTemporaryDirectory() + "tunlock-\(UUID().uuidString).conf"
         do { try config.render().write(toFile: tmp, atomically: true, encoding: .utf8) } catch { return error.localizedDescription }
@@ -337,6 +338,7 @@ final class StatusModel: ObservableObject {
         var cmd = "mkdir -p /usr/local/etc && install -o root -g wheel -m 644 \(shellQuote(tmp)) /usr/local/etc/tunlock.conf"
         cmd += " && /bin/bash \(shellQuote(Paths.bundled + "/install.sh")) --user \(shellQuote(NSUserName()))"
         if passwordless { cmd += " --sudoers" }
+        if confirmOff { cmd += " --confirm-off" }
         let r = await runAsAdmin(cmd)
         refresh()
         if r.cancelled { return L("Cancelled.", "Отменено.") }
