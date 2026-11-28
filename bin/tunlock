@@ -893,7 +893,7 @@ guard_sync_rules() {
     return 0
   fi
   G_APPLIED=''
-  log "pf: FAILED to apply phase $want: $G_ERROR"
+  log "pf: FAILED to apply phase $want (last confirmed: ${G_PHASE:-none}, exit check $G_EGRESS_CHECK): $G_ERROR"
   fail_closed
   return 1
 }
@@ -1006,7 +1006,7 @@ guard_tick() {
   # reconnected elsewhere under the same utun, so verify egress again.
   if (( G_LAST_TICK > 0 && now - G_LAST_TICK > 10 )) && [[ $G_EGRESS_OK == 1 ]]; then
     log "woke after $((now - G_LAST_TICK))s: re-verifying egress"
-    G_EGRESS_OK=0 G_EGRESS_CHECK=pending
+    G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_WAKE_AT=$now
   fi
   G_LAST_TICK=$now
   G_MODE=$(read_mode)
@@ -1040,7 +1040,7 @@ guard_tick() {
       G_APPLIED=''
     fi
     rm -f "$RUN_DIR/armed"
-    G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0
+    G_PHASE=direct G_TUN='' G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_ARMED=0 G_WAKE_AT=0
     G_PF_RULES=0 G_PF_REACHABLE=- G_CONFLICT='' G_SVC_LEFT=3
     if pf_enabled; then G_PF_ENABLED=1; else G_PF_ENABLED=0; fi
     return
@@ -1062,12 +1062,17 @@ guard_tick() {
   egress_still_valid "$now"
   # The Mac is about to sleep (tunlock-sleepwatch asks): close the tunnel now,
   # and keep it closed until a fresh exit check after wake.
-  local sleeping=0
+  local sleeping=0 slept=$G_SLEEPING
   G_SLEEPING=0
   if [[ -e $RUN_DIR/sleep-request ]]; then
     sleeping=1 G_SLEEPING=1
-    if [[ $G_EGRESS_OK == 1 ]]; then log "Mac going to sleep: tunnel closed until the exit is verified after wake"; fi
-    G_EGRESS_OK=0 G_EGRESS_CHECK=pending
+    if (( ! slept )); then
+      log "sleep requested: closing the tunnel (last confirmed: phase ${G_PHASE:-none}, exit check $G_EGRESS_CHECK)"
+    fi
+    G_EGRESS_OK=0 G_EGRESS_CHECK=pending G_WAKE_AT=0
+  elif (( slept )); then
+    log "woke: checking the exit before the tunnel reopens"
+    G_WAKE_AT=$now
   fi
   local rules_ok=1
   guard_sync_rules || rules_ok=0
@@ -1095,7 +1100,11 @@ guard_tick() {
   fi
   [[ $G_ARMED == 1 ]] || G_ERROR=${G_ERROR:-"existing connections not reset yet"}
   # Tell the sleep helper the tunnel is closed, so the Mac may sleep.
-  if (( sleeping )) && [[ $rules_ok == 1 && ! -e $RUN_DIR/sleep-ack ]]; then touch "$RUN_DIR/sleep-ack"; fi
+  # The ack carries the confirmed phase for the helper's log; mv so it never reads half a file.
+  if (( sleeping )) && [[ $rules_ok == 1 && ! -e $RUN_DIR/sleep-ack ]]; then
+    echo "$G_PHASE" > "$RUN_DIR/sleep-ack.tmp" && mv -f "$RUN_DIR/sleep-ack.tmp" "$RUN_DIR/sleep-ack"
+    log "sleep: pf phase $G_PHASE confirmed, the Mac may sleep"
+  fi
 
   # A TUN client that gave up (its port was dead while the entry blinked) is
   # started again once the forward is back: nothing else brings the tunnel
@@ -1146,21 +1155,29 @@ guard_tick() {
     # A pending tunlock run gets a probe of its own, made after its request.
     if (( now - G_PROBE_AT >= interval )) || [[ -n $G_CHECKS ]]; then
       G_PROBE_AT=$now G_PROBED=1
-      local loc=''
+      local loc='' aw=''
+      (( G_WAKE_AT == 0 )) || aw=", $((now - G_WAKE_AT))s after wake"
       read -r ip loc <<< "$(probe_egress || true)"
       [[ $loc =~ ^[A-Z]{2}$ ]] || loc=''
       [[ -z $ip ]] || G_EGRESS_COUNTRY=$loc
       if egress_matches "$ip" "$loc"; then
-        [[ $G_EGRESS_OK == 1 && $ip == "$G_EGRESS_IP" ]] || log "egress verified: $ip${loc:+ ($loc)} via $G_TUN"
+        [[ $G_EGRESS_OK == 1 && $ip == "$G_EGRESS_IP" ]] || log "egress verified: $ip${loc:+ ($loc)} via $G_TUN$aw"
         G_EGRESS_OK=1 G_EGRESS_IP=$ip G_EGRESS_AT=$now G_EGRESS_CHECK=ok
       elif [[ -n $ip ]]; then
-        log "egress MISMATCH: got $ip${loc:+ ($loc)}, expected $(expected_desc); tunnel closed"
+        log "egress MISMATCH: got $ip${loc:+ ($loc)}, expected $(expected_desc); tunnel closed$aw"
         G_EGRESS_OK=0 G_EGRESS_IP=$ip G_EGRESS_AT=$now G_EGRESS_CHECK=mismatch
       else
-        if [[ $G_EGRESS_OK == 1 ]]; then log "egress check got no answer: tunnel closed until verified"; fi
+        # After wake the first silence is logged too: the exit was not verified before it.
+        if [[ $G_EGRESS_OK == 1 ]] || { (( G_WAKE_AT > 0 )) && [[ $G_EGRESS_CHECK != no_answer ]]; }; then
+          log "egress check got no answer: tunnel closed until verified$aw"
+        fi
         G_EGRESS_OK=0 G_EGRESS_CHECK=no_answer
       fi
       guard_sync_rules || true
+      if [[ $G_PHASE == open ]] && (( G_WAKE_AT > 0 )); then
+        log "tunnel reopened $((now - G_WAKE_AT))s after wake"
+        G_WAKE_AT=0
+      fi
     fi
   fi
 
@@ -1184,7 +1201,7 @@ guard_init() {
   G_MODE='' G_PHASE='' G_TUN='' G_SSH='' G_EGRESS_IP='' G_EGRESS_OK=0 G_EGRESS_AT=0 G_EGRESS_CHECK=pending
   G_PF_ENABLED=0 G_PF_RULES=0 G_PF_REACHABLE=- G_ERROR='' G_APPLIED='' G_PROBE_AT=0 G_LAST_TICK=0
   G_ENTRY=unknown G_ENTRY_AT=0 G_SLEEPING=0 G_WARNING='' G_PHYS='' G_EGRESS_COUNTRY='' G_ACK_NEXT='' G_CONFLICT=''
-  G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD='' G_AI_CLOSED=0 G_AI_WARNED=''
+  G_SVC_AT=0 G_SVC_LEFT=3 G_SVC_CHECK_AT=0 G_SVC_WARN='' G_SVC_HELD='' G_AI_CLOSED=0 G_AI_WARNED='' G_WAKE_AT=0
   checks_init
   # A restarted guard must not reset connections again within one boot.
   G_ARMED=0

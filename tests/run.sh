@@ -302,6 +302,32 @@ rm -f "$STUB/run/sleep-request" "$STUB/run/sleep-ack"; gt 2
 expect_eq "sleep: after wake it reopens only after a fresh check" "$(st phase) $(st egress_ok)" "open 1"
 rm -rf "$STUB"
 
+# Sleep and wake in one guard: each step is logged once, with the confirmed phase and the time since wake
+guard_setup
+printf '#!/bin/bash\n[[ $1 == 0 ]] && touch "$STUB/run/sleep-request"\n[[ $1 == 2 ]] && { rm -f "$STUB/run/sleep-request" "$STUB/run/sleep-ack"; sleep 3; }\nexit 0\n' > "$hook"
+gt 4 "$hook"
+expect_eq "sleep log: request, confirmed phase, wake, exit check and reopening" \
+  "$(grep -cE 'sleep requested: closing the tunnel \(last confirmed: phase open, exit check ok\)' "$STUB/guard.log") \
+$(grep -c 'sleep: pf phase probe confirmed' "$STUB/guard.log") $(grep -c 'woke: checking the exit' "$STUB/guard.log") \
+$(grep -cE 'egress verified: .*, [0-9]+s after wake' "$STUB/guard.log") $(grep -cE 'tunnel reopened [0-9]+s after wake' "$STUB/guard.log")" \
+  "1 1 1 1 1"
+rm -rf "$STUB"
+
+# The exit is silent after wake: logged once, though it was not verified before
+guard_setup
+printf '#!/bin/bash\n[[ $1 == 0 ]] && touch "$STUB/run/sleep-request"\n[[ $1 == 2 ]] && { rm -f "$STUB/run/sleep-request" "$STUB/egress"; sleep 3; }\n[[ $1 == 3 ]] && sleep 3\nexit 0\n' > "$hook"
+gt 5 "$hook"
+expect_eq "sleep log: no answer after wake is logged once" \
+  "$(st phase) $(grep -cE 'egress check got no answer: .*[0-9]+s after wake' "$STUB/guard.log")" "probe 1"
+rm -rf "$STUB"
+
+# pf rejects the sleep phase: no ack for the helper, the log tells requested from last confirmed
+guard_setup; printf '#!/bin/bash\n[[ $1 == 0 ]] && { touch "$STUB/run/sleep-request"; : > "$STUB/pf_fail"; }\nexit 0\n' > "$hook"; gt 2 "$hook"
+expect_eq "sleep log: an unconfirmed phase is not acked and names both phases" \
+  "$([[ -e $STUB/run/sleep-ack ]] && echo ack || echo no-ack) $(grep -c 'FAILED to apply phase probe (last confirmed: open, exit check pending)' "$STUB/guard.log")" \
+  "no-ack 1"
+rm -rf "$STUB"
+
 # Block reasons: one code from the guard, the same order as the verdict
 reason() { TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status --porcelain | awk -F= '$1 == "reason" { print $2 }'; }
 human() { TUNLOCK_CONF=$STUB/conf TUNLOCK_RUN_DIR=$STUB/run $T status 2>&1 || true; }

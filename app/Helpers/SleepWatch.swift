@@ -29,16 +29,32 @@ func log(_ s: String) {
     fflush(stdout)
 }
 
+// What the guard last wrote to its state: the phase pf took and the exit check.
+func lastConfirmed() -> String {
+    let lines = (try? String(contentsOfFile: runDir + "/state", encoding: .utf8))?.split(separator: "\n") ?? []
+    func value(_ key: String) -> String {
+        lines.first { $0.hasPrefix(key + "=") }.map { String($0.dropFirst(key.count + 1)) } ?? "unknown"
+    }
+    return "phase \(value("phase")), exit check \(value("egress_check"))"
+}
+
 let callback: IOServiceInterestCallback = { _, _, messageType, argument in
     switch messageType {
     case kCanSystemSleep:
         IOAllowPowerChange(rootPort, Int(bitPattern: argument))
     case kSystemWillSleep:
         try? FileManager.default.removeItem(atPath: ack)
-        FileManager.default.createFile(atPath: request, contents: Data("\(Date().timeIntervalSince1970)\n".utf8))
-        let deadline = Date().addingTimeInterval(5)
+        let start = Date()
+        FileManager.default.createFile(atPath: request, contents: Data("\(start.timeIntervalSince1970)\n".utf8))
+        log("sleep requested, waiting for the guard to close the tunnel")
+        let deadline = start.addingTimeInterval(5)
         while !FileManager.default.fileExists(atPath: ack), Date() < deadline { usleep(100_000) }
-        log(FileManager.default.fileExists(atPath: ack) ? "tunnel closed, sleeping" : "no answer from the guard in 5 s, sleeping anyway")
+        let ms = Int(Date().timeIntervalSince(start) * 1000)
+        if let phase = try? String(contentsOfFile: ack, encoding: .utf8) {
+            log("guard confirmed pf phase \(phase.trimmingCharacters(in: .whitespacesAndNewlines)) in \(ms) ms, sleeping")
+        } else {
+            log("no confirmation from the guard in \(ms) ms (last confirmed: \(lastConfirmed())), sleeping anyway")
+        }
         IOAllowPowerChange(rootPort, Int(bitPattern: argument))
     case kSystemHasPoweredOn:
         try? FileManager.default.removeItem(atPath: request)
