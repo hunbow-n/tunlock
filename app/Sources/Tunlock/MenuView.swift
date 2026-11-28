@@ -53,6 +53,11 @@ struct MenuView: View {
                 modeSwitch
                 if let prompt = model.offPrompt { offConfirmation(prompt) }
                 if !model.aiClients.isEmpty { aiClientsLine }
+                if model.keepingAwake {
+                    Label(L("Mac stays awake while they run", "Mac не уснёт, пока они запущены"), systemImage: "cup.and.saucer")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 card { route(v) }
                 card { traffic }
                 extras(v)

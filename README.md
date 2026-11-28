@@ -144,6 +144,10 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
 - **Before sleep** the tunnel closes; after waking it reopens only once the exit
   is verified again. A Mac that wakes on another Wi-Fi sends nothing through a
   tunnel that may have reconnected elsewhere.
+- **Keep the Mac awake while AI clients run** (General, off by default) stops
+  sleep from inactivity while Claude Code, Codex or ChatGPT is open, so a long
+  session is not cut off. The display can still turn off; closing the lid or
+  choosing Sleep still puts the Mac to sleep. The menu shows when it is holding.
 
 The build is ad-hoc signed and not notarized. A copy you build yourself opens
 normally. A downloaded copy needs right-click → **Open** the first time.

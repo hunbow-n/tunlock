@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit.pwr_mgt
 import SwiftUI
 
 enum Verdict {
@@ -121,6 +122,9 @@ final class StatusModel: ObservableObject {
     /// AI clients running now (display names), checked every few seconds.
     @Published private(set) var aiClients: [String] = []
     private var aiCheckedAt = Date.distantPast
+    /// True while the "keep awake" option holds off idle sleep for running AI clients.
+    @Published private(set) var keepingAwake = false
+    private var sleepAssertion: IOPMAssertionID = 0
 
     private var meter = RateMeter()
     private var timer: Timer?
@@ -167,6 +171,7 @@ final class StatusModel: ObservableObject {
         }
         checkDirectIP()
         checkAIClients()
+        holdIdleSleep()
         trackVerdict()
         watchDraft()
     }
@@ -175,6 +180,22 @@ final class StatusModel: ObservableObject {
         guard Date().timeIntervalSince(aiCheckedAt) > 3 else { return }
         aiCheckedAt = Date()
         Task { aiClients = aiDisplayNames(await runningAIProcesses() ?? []) }
+    }
+
+    /// Blocks only idle sleep: closing the lid, choosing Sleep or a critical
+    /// battery still sleep the Mac, and the system drops the assertion when
+    /// Tunlock exits, so nothing is left behind.
+    private func holdIdleSleep() {
+        let want = UserDefaults.standard.bool(forKey: "keepAwake") && !aiClients.isEmpty
+        guard want != keepingAwake else { return }
+        if want {
+            keepingAwake = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Tunlock: AI clients are running" as CFString, &sleepAssertion) == kIOReturnSuccess
+        } else {
+            IOPMAssertionRelease(sleepAssertion)
+            keepingAwake = false
+        }
     }
 
     /// Process names of the AI clients running now; nil when the check failed.
