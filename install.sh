@@ -129,11 +129,18 @@ if (( SUDOERS )); then
 else
   rm -f /etc/sudoers.d/tunlock
 fi
-# Marks the setting for the app, written only after the sudoers entry matches it.
+# A password typed for sudo in the last minutes would otherwise let any later
+# sudo in that terminal, an agent's included, run off without asking.
 if (( CONFIRM_OFF )); then
+  tmp=$(mktemp)
+  echo "Defaults!$PREFIX/libexec/tunlock/tunlock timestamp_timeout=0" > "$tmp"
+  visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers entry rejected"; }
+  install -o root -g wheel -m 440 "$tmp" /etc/sudoers.d/tunlock-confirm-off
+  rm -f "$tmp"
+  # Marks the setting for the app, written only after sudoers matches it.
   install -o root -g wheel -m 644 /dev/null /var/db/tunlock/confirm-off
 else
-  rm -f /var/db/tunlock/confirm-off
+  rm -f /etc/sudoers.d/tunlock-confirm-off /var/db/tunlock/confirm-off
 fi
 
 echo "Installed. Mode: $(cat /var/db/tunlock/mode). Next:"

@@ -96,13 +96,13 @@ evaluated earlier would decide first and hide what tunlock does.
     stay reachable, and its `BYPASS_DNS` domains must resolve.
 13. **Password to turn off.** Save with **Switch modes without a password** and
     **Ask for the Mac password to turn off** checked, then turn protection on.
-    `sudo -n /usr/local/libexec/tunlock/tunlock off` and `tunlock off
-    </dev/null` from a process without a terminal must fail, and status must
-    stay `PROTECTED` or `BLOCKED`. `tunlock on` still needs no password. In the
-    app, switching off shows the password prompt: Cancel leaves protection on,
-    the right password turns it off. Unchecking the setting asks for the
-    password; Cancel leaves the setting checked. Quitting the app (Cmd+Q)
-    leaves the status unchanged.
+    Run `sudo true` and type the password, then in the same terminal
+    `sudo -n tunlock off`: it must fail, and status must stay `PROTECTED` or
+    `BLOCKED`. `tunlock on` still needs no password. In the app, switching off
+    shows the password prompt: Cancel leaves protection on, the right password
+    turns it off. Unchecking the setting shows the password prompt at once;
+    Cancel leaves it checked. Quitting the app (Cmd+Q) leaves the status
+    unchanged.
 
 ## Results
 
