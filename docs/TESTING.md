@@ -76,7 +76,12 @@ evaluated earlier would decide first and hide what tunlock does.
    step 2. The IPv6 checks must fail.
 8. **Sleep.** With the loop from step 6 running, close the lid for at least a
    minute, then open it. The loop prints nothing, and status returns to
-   `PROTECTED` or stays `BLOCKED`.
+   `PROTECTED` or stays `BLOCKED`. In `/var/log/tunlock.log`, before sleep:
+   `sleep requested`, then `sleep: pf phase probe confirmed` and the helper's
+   `guard confirmed pf phase probe in N ms`, or its `no confirmation` line
+   with the last confirmed phase. After wake: `woke`, the exit check result
+   with the seconds since wake, and `tunnel reopened`. Their times must match
+   the Sleep and Wake entries of `pmset -g log | grep -E 'Sleep|Wake'`.
 9. **Wi-Fi change.** Switch to another network or a phone hotspot, with the
    same loop running.
 10. **Reboot in protected mode.** After login, `tunlock status` must show
