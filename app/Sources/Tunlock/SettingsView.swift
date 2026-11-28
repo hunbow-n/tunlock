@@ -41,6 +41,7 @@ struct SettingsView: View {
     @AppStorage(HopNames.entryKey) private var entryName = ""
     @AppStorage(HopNames.exitKey) private var exitName = ""
     @AppStorage("showFlag") private var showFlag = true
+    @AppStorage("keepAwake") private var keepAwake = false
 
     enum Check: Equatable {
         case idle, running, ok(String), failed(String)
@@ -600,6 +601,7 @@ struct SettingsView: View {
                 .disabled(applyingConfirmOff || saving)
             Toggle(L("Notify when the internet closes or protection returns", "Уведомлять, когда интернет закрылся или защита вернулась"), isOn: $notify)
                 .onChange(of: notify) { on in if on { Notifier.requestPermission() } }
+            Toggle(L("Keep the Mac awake while AI clients run", "Не усыплять Mac, пока запущены AI-клиенты"), isOn: $keepAwake)
             Toggle(L("Show the exit country flag in the menu bar", "Показывать флаг страны выхода в строке меню"), isOn: $showFlag)
             Toggle(L("Open Tunlock at login", "Открывать Tunlock при входе"), isOn: $launchAtLogin)
                 .onChange(of: launchAtLogin) { on in
@@ -609,8 +611,8 @@ struct SettingsView: View {
         } header: {
             Text(L("Behaviour", "Поведение"))
         } footer: {
-            FooterText(L("Protection is enforced by a background service, so it works even when this app is closed. After a restart in protected mode, the internet stays blocked until the tunnel is verified. With the Mac password required to turn off, neither an AI agent nor a script can switch protection off on its own, even when modes switch without a password; turning this setting off asks for the password too.",
-                   "Защиту держит фоновая служба: она работает и при закрытом приложении. После перезагрузки в защищённом режиме интернет остаётся закрытым, пока туннель не пройдёт проверку. Если для выключения нужен пароль Mac, ни AI-агент, ни скрипт не выключат защиту сами, даже когда режимы переключаются без пароля. Отключение этой настройки тоже требует пароль."))
+            FooterText(L("Protection is enforced by a background service, so it works even when this app is closed. After a restart in protected mode, the internet stays blocked until the tunnel is verified. With the Mac password required to turn off, neither an AI agent nor a script can switch protection off on its own, even when modes switch without a password; turning this setting off asks for the password too. Keeping the Mac awake stops only sleep from inactivity: the display can still turn off, and closing the lid or choosing Sleep still puts the Mac to sleep.",
+                   "Защиту держит фоновая служба: она работает и при закрытом приложении. После перезагрузки в защищённом режиме интернет остаётся закрытым, пока туннель не пройдёт проверку. Если для выключения нужен пароль Mac, ни AI-агент, ни скрипт не выключат защиту сами, даже когда режимы переключаются без пароля. Отключение этой настройки тоже требует пароль. Запрет сна действует только на сон от бездействия: экран может погаснуть, а закрытая крышка или пункт «Режим сна» по-прежнему усыпляют Mac."))
         }
     }
 
