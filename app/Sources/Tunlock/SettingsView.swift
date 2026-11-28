@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var passwordless = FileManager.default.fileExists(atPath: Paths.sudoers)
         || !FileManager.default.fileExists(atPath: Paths.config)
     @State private var confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
+    @State private var applyingConfirmOff = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var tuns: [TunInterface] = tunInterfaces()
     @State private var sshCheck: Check = .idle
@@ -594,7 +595,9 @@ struct SettingsView: View {
     private var behaviourSection: some View {
         Section {
             Toggle(L("Switch modes without a password", "Переключать режимы без пароля"), isOn: $passwordless)
-            Toggle(L("Ask for the Mac password to turn off", "Спрашивать пароль Mac для выключения"), isOn: $confirmOff)
+            Toggle(L("Ask for the Mac password to turn off", "Спрашивать пароль Mac для выключения"),
+                   isOn: Binding(get: { confirmOff }, set: setConfirmOff))
+                .disabled(applyingConfirmOff || saving)
             Toggle(L("Notify when the internet closes or protection returns", "Уведомлять, когда интернет закрылся или защита вернулась"), isOn: $notify)
                 .onChange(of: notify) { on in if on { Notifier.requestPermission() } }
             Toggle(L("Show the exit country flag in the menu bar", "Показывать флаг страны выхода в строке меню"), isOn: $showFlag)
@@ -874,6 +877,21 @@ struct SettingsView: View {
             let r = await run("/usr/bin/nc", ["-z", "-G", "4", c.proxyHost, c.proxyPort])
             proxyCheck = r.ok ? .ok(L("Proxy answers", "Прокси отвечает"))
                               : .failed(L("No answer from \(c.proxyHost):\(c.proxyPort)", "Нет ответа от \(c.proxyHost):\(c.proxyPort)"))
+        }
+    }
+
+    /// Applied at once behind the administrator prompt, to the installed config
+    /// rather than the form: a toggle that looks off while the setting still
+    /// holds would mislead. Before the first install, Save applies it.
+    private func setConfirmOff(_ on: Bool) {
+        confirmOff = on
+        guard let installed = TunConfig.loadInstalled() else { return }
+        applyingConfirmOff = true
+        Task {
+            let error = await model.apply(installed, passwordless: FileManager.default.fileExists(atPath: Paths.sudoers), confirmOff: on)
+            confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
+            applyingConfirmOff = false
+            if let error { saveError = error }
         }
     }
 

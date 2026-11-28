@@ -117,7 +117,8 @@ cp -R build/Tunlock.app /Applications/ && open /Applications/Tunlock.app
    service. With **Switch modes without a password** checked, it never asks again.
    With **Ask for the Mac password to turn off** also checked, only switching
    off still asks, so an AI agent or a script cannot turn protection off on its
-   own. Unchecking it asks for the password too.
+   own, even right after you typed a sudo password in the same terminal. The
+   switch applies at once and asks for the password both ways.
 5. Flip the switch in the menu bar. If AI apps are still running when you
    switch off, confirm or cancel in the Tunlock panel.
 
