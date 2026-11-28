@@ -8,6 +8,8 @@ enum Paths {
     static let state = ProcessInfo.processInfo.environment["TUNLOCK_UI_STATE"] ?? "/var/run/tunlock/state"
     static let daemon = ProcessInfo.processInfo.environment["TUNLOCK_UI_DAEMON"] ?? "/Library/LaunchDaemons/tunlock.guard.plist"
     static let sudoers = "/etc/sudoers.d/tunlock"
+    /// Root-owned: off asks for the Mac password even with the sudoers entry (install.sh --confirm-off).
+    static let confirmOff = "/var/db/tunlock/confirm-off"
     static let guardLog = ProcessInfo.processInfo.environment["TUNLOCK_UI_LOG"] ?? "/var/log/tunlock.log"
     static var sshLog: String { NSHomeDirectory() + "/Library/Logs/tunlock-ssh.log" }
     static var bundled: String { (Bundle.main.resourcePath ?? "") + "/backend" }

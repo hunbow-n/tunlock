@@ -14,6 +14,8 @@ struct SettingsView: View {
     }
     @State private var passwordless = FileManager.default.fileExists(atPath: Paths.sudoers)
         || !FileManager.default.fileExists(atPath: Paths.config)
+    @State private var confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
+    @State private var applyingConfirmOff = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var tuns: [TunInterface] = tunInterfaces()
     @State private var sshCheck: Check = .idle
@@ -213,7 +215,9 @@ struct SettingsView: View {
         applyStage = .saving
         let version = loadedDraft, snapshot = config
         Task {
-            if let error = await model.apply(snapshot, passwordless: passwordless) {
+            let error = await model.apply(snapshot, passwordless: passwordless, confirmOff: confirmOff)
+            confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
+            if let error {
                 applyStage = .done(text: error, success: false)
                 return
             }
@@ -591,6 +595,9 @@ struct SettingsView: View {
     private var behaviourSection: some View {
         Section {
             Toggle(L("Switch modes without a password", "Переключать режимы без пароля"), isOn: $passwordless)
+            Toggle(L("Ask for the Mac password to turn off", "Спрашивать пароль Mac для выключения"),
+                   isOn: Binding(get: { confirmOff }, set: setConfirmOff))
+                .disabled(applyingConfirmOff || saving)
             Toggle(L("Notify when the internet closes or protection returns", "Уведомлять, когда интернет закрылся или защита вернулась"), isOn: $notify)
                 .onChange(of: notify) { on in if on { Notifier.requestPermission() } }
             Toggle(L("Show the exit country flag in the menu bar", "Показывать флаг страны выхода в строке меню"), isOn: $showFlag)
@@ -602,8 +609,8 @@ struct SettingsView: View {
         } header: {
             Text(L("Behaviour", "Поведение"))
         } footer: {
-            FooterText(L("Protection is enforced by a background service, so it works even when this app is closed. After a restart in protected mode, the internet stays blocked until the tunnel is verified.",
-                   "Защиту держит фоновая служба: она работает и при закрытом приложении. После перезагрузки в защищённом режиме интернет остаётся закрытым, пока туннель не пройдёт проверку."))
+            FooterText(L("Protection is enforced by a background service, so it works even when this app is closed. After a restart in protected mode, the internet stays blocked until the tunnel is verified. With the Mac password required to turn off, neither an AI agent nor a script can switch protection off on its own, even when modes switch without a password; turning this setting off asks for the password too.",
+                   "Защиту держит фоновая служба: она работает и при закрытом приложении. После перезагрузки в защищённом режиме интернет остаётся закрытым, пока туннель не пройдёт проверку. Если для выключения нужен пароль Mac, ни AI-агент, ни скрипт не выключат защиту сами, даже когда режимы переключаются без пароля. Отключение этой настройки тоже требует пароль."))
         }
     }
 
@@ -873,15 +880,32 @@ struct SettingsView: View {
         }
     }
 
+    /// Applied at once behind the administrator prompt, to the installed config
+    /// rather than the form: a toggle that looks off while the setting still
+    /// holds would mislead. Before the first install, Save applies it.
+    private func setConfirmOff(_ on: Bool) {
+        confirmOff = on
+        guard let installed = TunConfig.loadInstalled() else { return }
+        applyingConfirmOff = true
+        Task {
+            let error = await model.apply(installed, passwordless: FileManager.default.fileExists(atPath: Paths.sudoers), confirmOff: on)
+            confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
+            applyingConfirmOff = false
+            if let error { saveError = error }
+        }
+    }
+
     private func save() {
         saving = true
         saveError = nil
         let version = loadedDraft  // the draft being saved, fixed now: "Load" may change loadedDraft meanwhile
         let snapshot = config
         Task {
-            saveError = await model.apply(snapshot, passwordless: passwordless)
+            saveError = await model.apply(snapshot, passwordless: passwordless, confirmOff: confirmOff)
             saving = false
             saved = saveError == nil
+            // Show what is installed, not what was asked for.
+            confirmOff = FileManager.default.fileExists(atPath: Paths.confirmOff)
             if saved, version != nil {  // that draft is now the real config; a newer one stays
                 removeDraft(ifStill: version)
                 if loadedDraft == version { loadedDraft = nil }

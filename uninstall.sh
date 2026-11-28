@@ -78,7 +78,7 @@ if [[ -n $USER_NAME && $USER_NAME != root ]]; then
   # Removed as the user, like it was written.
   sudo -u "$USER_NAME" -- /bin/rm -f "$home/Library/LaunchAgents/tunlock.ssh.plist"
 fi
-rm -rf "$PREFIX/libexec/tunlock" "$DB_DIR" "$RUN_DIR" "$SUDOERS"
+rm -rf "$PREFIX/libexec/tunlock" "$DB_DIR" "$RUN_DIR" "$SUDOERS" "$SUDOERS-confirm-off"
 [[ -L $PREFIX/bin/tunlock ]] && rm -f "$PREFIX/bin/tunlock"
 (( PURGE )) && rm -f "$PREFIX/etc/tunlock.conf"
 echo "tunlock removed. Direct internet is allowed."
